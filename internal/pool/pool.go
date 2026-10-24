@@ -61,6 +61,8 @@ type Config struct {
 	KeepaliveWindow time.Duration        // 保活心跳窗口，超过此时间无活动则发送心跳
 	LoginConfig     upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
 	CheckinClient   CheckinClient        // 可选活动客户端；nil 使用账号 Client
+	BenefitClient   BenefitClient        // 可选福利领取客户端；nil 使用账号 Client
+	CreditsClient   CreditsClient        // 可选积分查询客户端；nil 使用账号 Client
 }
 
 // Pool 账号池。
@@ -69,6 +71,13 @@ type Pool struct {
 	state    string
 	mu       sync.Mutex
 	accounts []*Account
+
+	benefitMu       sync.Mutex
+	benefitDays     map[string]*benefitDay      // name -> 最近一次领取结果
+	benefitInflight map[string]*benefitInflight // name -> 进行中的领取（单飞）
+
+	creditsMu    sync.Mutex
+	creditsCache map[string]creditCacheEntry // name -> 积分快照（TTL 10 分钟）
 }
 
 // New 构建池。
@@ -96,7 +105,13 @@ func New(auths []*auth.Auth, cfg Config, stateFile string) (*Pool, error) {
 	if cfg.LoginConfig.ClientID == "" {
 		cfg.LoginConfig = upstream.DefaultLoginConfig()
 	}
-	p := &Pool{cfg: cfg, state: stateFile}
+	p := &Pool{
+		cfg:             cfg,
+		state:           stateFile,
+		benefitDays:     map[string]*benefitDay{},
+		benefitInflight: map[string]*benefitInflight{},
+		creditsCache:    map[string]creditCacheEntry{},
+	}
 	for _, a := range auths {
 		acct := &Account{
 			Name:              a.UserID,
@@ -185,13 +200,25 @@ func (p *Pool) List() []map[string]any {
 		if reason == "" {
 			reason = a.lastErr
 		}
+		creditsTotal := float64(-1) // -1 = 尚未查询
+		creditsText := ""
+		if snap := p.cachedCreditsFor(a.Name); snap != nil {
+			for _, b := range snap.Buckets {
+				if b.Name == upstream.MetricTotalCredit {
+					creditsTotal = b.Remain
+				}
+			}
+			creditsText = creditsTextOf(snap)
+		}
 		out = append(out, map[string]any{
 			"name":              a.Name,
 			"uid":               a.UID,
 			"nickname":          a.UserName,
 			"user_name":         a.UserName,
 			"default_model":     a.DefaultModel,
-			"credits":           int64(0), // 保留旧字段；未查询真实余额
+			"credits":           int64(0), // 保留旧字段；真实积分见 credits_total/credits_text
+			"credits_total":     creditsTotal,
+			"credits_text":      creditsText,
 			"checkin":           a.checkin,
 			"disabled":          a.disabled,
 			"cooling":           cooling,
@@ -647,6 +674,24 @@ func (p *Pool) RefreshToken(name string) error {
 	}
 
 	resp, err := acct.Client.RefreshToken(context.Background(), p.cfg.LoginConfig, refreshToken, authz.Verifier(), upstream.DPoPPrivateJWK(dpopPrivateJWK))
+	if err != nil {
+		var expired *upstream.RefreshTokenExpiredError
+		if errors.As(err, &expired) {
+			// refresh_token 是一次性的：`cmd/apply`/`cmd/login` 或另一个实例
+			// 可能已把它换新。采纳磁盘上的最新凭证再试一次，仍失败才作废。
+			if rerr := authz.Reload(); rerr == nil {
+				if fresh := authz.Refresh(); fresh != "" && fresh != refreshToken {
+					retryResp, retryErr := acct.Client.RefreshToken(context.Background(), p.cfg.LoginConfig,
+						fresh, authz.Verifier(), upstream.DPoPPrivateJWK(authz.DPoPPrivateJWK()))
+					if retryErr == nil {
+						resp = retryResp
+						err = nil
+						log.Printf("pool refresh recovered account=%s using credentials refreshed elsewhere", name)
+					}
+				}
+			}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("refresh failed: %w", err)
 	}

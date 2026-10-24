@@ -111,9 +111,20 @@ func New(userID, userName, domainID, token, ak, sk, expiration, refreshToken, co
 	return a
 }
 
+// fileNameUnsafeReplacer 把 Windows/Linux 文件名里非法或危险的字符统一替换成
+// 下划线：user_id 可能是带冒号的 principal_urn（iam::…:user:NAME，插件同口径），
+// 冒号在 Windows 文件名里非法。
+var fileNameUnsafeReplacer = strings.NewReplacer(
+	":", "_", "\\", "_", "/", "_", "*", "_", "?", "_",
+	"\"", "_", "<", "_", ">", "_", "|", "_",
+)
+
 // FileName 返回 auth 文件名。
+//
+// user_id 里的文件名非法字符（冒号等）替换为下划线；映射稳定，账号之间不会
+// 撞名。池/面板仍使用原始 user_id，只有文件名做净化。
 func (a *Auth) FileName() string {
-	id := strings.ReplaceAll(a.UserID, string(filepath.Separator), "_")
+	id := fileNameUnsafeReplacer.Replace(a.UserID)
 	if id == "" {
 		id = "unknown"
 	}
@@ -178,6 +189,40 @@ func (a *Auth) UpdateIdentity(userID, userName, domainID string) error {
 	}
 	a.UpdatedAt = time.Now().Unix()
 	return saveLocked(a.path, a)
+}
+
+// Reload 从磁盘重读凭证文件并就地更新本结构（保留 path）。
+//
+// refresh_token 是一次性的：`cmd/apply`、`cmd/login` 或另一个实例可能已在
+// 本服务刷新失败之前把它换新——此时采纳磁盘上的最新凭证重试，而不是要求
+// 重新登录。只覆盖可轮换字段；路径与并发锁不动。
+func (a *Auth) Reload() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.path == "" {
+		return fmt.Errorf("auth path unknown")
+	}
+	data, err := os.ReadFile(a.path)
+	if err != nil {
+		return err
+	}
+	var fresh Auth
+	if err := json.Unmarshal(data, &fresh); err != nil {
+		return err
+	}
+	a.CloudDragonTok = fresh.CloudDragonTok
+	a.AccessKeyID = fresh.AccessKeyID
+	a.SecretAccessKey = fresh.SecretAccessKey
+	a.Expiration = fresh.Expiration
+	a.RefreshToken = fresh.RefreshToken
+	a.UpdatedAt = fresh.UpdatedAt
+	if fresh.ClientID != "" {
+		a.ClientID = fresh.ClientID
+	}
+	if len(fresh.DPoPPrivateKey) > 0 {
+		a.DPoPPrivateKey = fresh.DPoPPrivateKey
+	}
+	return nil
 }
 
 // SetPathAndSave 设置落盘路径并写出（WebUI 登录在拿到身份后才能确定文件名）。

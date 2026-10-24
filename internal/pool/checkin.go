@@ -56,5 +56,9 @@ func (p *Pool) Checkin(ctx context.Context, name string) (upstream.CheckinResult
 	a.mu.Lock()
 	a.checkin = &CheckinStatus{OK: result.OK, Message: result.Message, CheckedAt: time.Now()}
 	a.mu.Unlock()
+	// 签到成功会入账新积分：丢掉积分缓存，下一次查询强制重读（插件同口径）。
+	if err == nil && result.OK {
+		p.InvalidateCredits(name)
+	}
 	return result, err
 }

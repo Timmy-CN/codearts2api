@@ -1,6 +1,8 @@
 // 常量：CodeArts Agent 云端 API（来自 resources/app/extensions/vscode-codebot 逆向）。
 package upstream
 
+import "time"
+
 const (
 	// SnapEngineApiHost 盘古引擎/聊天网关（snap-access，product.json snapEngineDomain）。
 	SnapEngineApiHost = "https://snap-access.cn-north-4.myhuaweicloud.com"
@@ -34,6 +36,13 @@ const (
 	BenefitHost     = "https://opengw.developer.huaweicloud.com"
 	EpBenefitConfig = "/api/v1/gateway/config"
 	EpBenefitClaim  = "/api/v1/benefit/claim"
+
+	// 网关排队：429 + queue-status:queued + trace-id 后轮询直至 promoted。
+	EpTraceQueues = "/api/v1/concurrency/trace-queues"
+	QueueBudget   = 300 * time.Second
+	// MaxOutputTokens 是上游单次回答的 token 上限（插件 MAX_OUTPUT_TOKENS），
+	// 请求里更大的 max_tokens 一律钳到该值。
+	MaxOutputTokens = 65536
 
 	// 登录/令牌
 	EpLoginTicket    = "/v1/login/ticket"

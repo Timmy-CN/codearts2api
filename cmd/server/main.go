@@ -49,6 +49,7 @@ func main() {
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:              p,
+		BenefitAutoClaim:  cfg.BenefitAutoClaim,
 		Enabled:           cfg.Watch.Enabled,
 		CreditsAutoClaim:  cfg.CreditsAutoClaim,
 		PollInterval:      time.Duration(cfg.Watch.PollMinutes) * time.Minute,

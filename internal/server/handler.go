@@ -4,7 +4,6 @@ package server
 import (
 	crand "crypto/rand"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -69,12 +68,11 @@ type staticModel struct {
 // 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-09-15 真实账号
 // 逐个调用验证（见 docs/reverse-engineering.md §7）：
 //
-//	✅ GLM-5.2、glm-5.2-sft-harmony、Qwen3-VL-235B
+//	✅ GLM-5.2、glm-5.2-sft-harmony
 //	❌ GLM-5.2-ArkTS-SPARK、OpenPangu-2.0-Pro、OpenPangu-2.0-Flash（002002009.404）
 var staticModels = []staticModel{
 	{ID: "GLM-5.2", ContextWindow: 202752},
 	{ID: "glm-5.2-sft-harmony", ContextWindow: 131072},
-	{ID: "Qwen3-VL-235B", ContextWindow: 131072},
 	// 限时福利（需领取；领取后实测可用，聊天自动带 maas_type: benefit）
 	{ID: "deepseek-v4-flash-0731", ContextWindow: 1048576, Benefit: true},
 	{ID: "deepseek-v4-pro-0813", ContextWindow: 1048576, Benefit: true},
@@ -319,7 +317,7 @@ func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier stri
 		uid, uname, domain := lookupIdentity(a)
 		if uid == "" {
 			// 兜底：refresh_token 里的 sub 是唯一且稳定的，避免写出 unknown 文件
-			uid = identityFromRefreshToken(tok.RefreshToken)
+			uid = upstream.IdentityFromRefreshToken(tok.RefreshToken).ID
 			log.Printf("webui login: identity lookup failed, fallback user_id=%q", uid)
 		}
 		if uid != "" {
@@ -361,25 +359,6 @@ func lookupIdentity(a *auth.Auth) (uid, name, domain string) {
 		log.Printf("webui login: current/user: %v", err)
 	}
 	return "", "", ""
-}
-
-// identityFromRefreshToken 从 JWT 形式的 refresh_token 里取 sub 作为兜底 user_id。
-func identityFromRefreshToken(tok string) string {
-	parts := strings.Split(tok, ".")
-	if len(parts) < 2 {
-		return ""
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return ""
-	}
-	var claims struct {
-		Sub string `json:"sub"`
-	}
-	if json.Unmarshal(raw, &claims) != nil {
-		return ""
-	}
-	return claims.Sub
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -477,7 +456,7 @@ func (h *Handler) modelKnownUnusable(model string) bool {
 func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 	out := make([]map[string]any, 0, len(infos)+len(staticModels))
 	seen := map[string]bool{}
-	add := func(id string, ctx, maxOut int64, benefit bool) {
+	addInfo := func(id string, ctx, maxOut int64, benefit bool, rate float64, reasoning bool) {
 		if id == "" || seen[id] {
 			return
 		}
@@ -498,20 +477,26 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 		if benefit {
 			entry["benefit"] = true
 		}
+		if rate > 0 {
+			entry["rate"] = rate
+		}
+		if reasoning {
+			entry["reasoning"] = true
+		}
 		out = append(out, entry)
 	}
 	// addAlias 精确 ID + 就近补一条小写别名（已是小写则跳过）。
-	addAlias := func(id string, ctx, maxOut int64, benefit bool) {
-		add(id, ctx, maxOut, benefit)
-		if lower := strings.ToLower(id); lower != id {
-			add(lower, ctx, maxOut, benefit)
+	addAlias := func(mi upstream.ModelInfo) {
+		addInfo(mi.ID, mi.ContextWindow, mi.MaxTokens, mi.Benefit, mi.Rate, mi.Reasoning)
+		if lower := strings.ToLower(mi.ID); lower != mi.ID {
+			addInfo(lower, mi.ContextWindow, mi.MaxTokens, mi.Benefit, mi.Rate, mi.Reasoning)
 		}
 	}
 	for _, mi := range infos {
-		addAlias(mi.ID, mi.ContextWindow, mi.MaxTokens, mi.Benefit)
+		addAlias(mi)
 	}
 	for _, sm := range staticModels {
-		addAlias(sm.ID, sm.ContextWindow, 0, sm.Benefit)
+		addAlias(upstream.ModelInfo{ID: sm.ID, ContextWindow: sm.ContextWindow, Benefit: sm.Benefit})
 	}
 	return out
 }
@@ -782,11 +767,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var rc io.ReadCloser
 		var serr error
 		authRetried := false
+		benefitRetried := false
+		thinkingRetried := false
+		thinkingInjected := req.Thinking == nil
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
 		benefit := upstream.IsBenefitModel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让
 		for retry := 0; retry < h.cfg.QueueMaxAttempts; retry++ {
-			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, benefit)
+			rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, benefit, acct.UID)
 			if serr == nil {
 				break
 			}
@@ -805,6 +793,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				} else {
 					log.Printf("upstream 401 account=%s: refresh before retry failed: %v", acct.Name, rerr)
 				}
+			}
+			// 福利模型报「benefit not found」多半是当天还没领取（北京时间跨天、
+			// 上次领取已过期）。照 magpie 插件口径：先补领一次再重发同一账号。
+			if !benefitRetried && benefit && isBenefitNotClaimedError(serr) {
+				benefitRetried = true
+				log.Printf("benefit model %s rejected account=%s: claiming today's benefit then retrying", model, acct.Name)
+				if h.cfg.Pool.EnsureBenefitClaimed(r.Context(), acct.Name) {
+					continue
+				}
+			}
+			// 注入的 thinking 被模型以参数错误拒绝（上游文案会点名 thinking）：
+			// 摘除后同账号重发一次（插件 /thinking/i 同口径）。其余参数错误
+			// 不重试——换号或重发都是同样的 400。
+			if !thinkingRetried && thinkingInjected && isParamInvalidError(serr) &&
+				strings.Contains(strings.ToLower(serr.Error()), "thinking") {
+				disabledThinking := false
+				chatOpts.Thinking = &disabledThinking
+				thinkingRetried = true
+				log.Printf("upstream rejected thinking account=%s: retrying without it", acct.Name)
+				continue
 			}
 			if errors.As(serr, &ae) && isQueueLimitError(ae) {
 				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
@@ -1095,6 +1103,18 @@ func buildCompletion(model, reasoning, content string, calls []openAIToolCall, f
 		resp["usage"] = usage
 	}
 	return resp
+}
+
+// isBenefitNotClaimedError 识别「限时福利未领取/已过期」类上游错误
+// （InferHub.4004/4005、benefit not found）。这类错误领取当天福利后即恢复。
+func isBenefitNotClaimedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "benefit not found") ||
+		strings.Contains(msg, "inferhub.4004") ||
+		strings.Contains(msg, "inferhub.4005")
 }
 
 // handleUpstreamError 记录错误并决定是否处罚账号。

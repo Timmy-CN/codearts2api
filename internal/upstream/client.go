@@ -21,6 +21,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,12 +134,12 @@ func New(timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = 120 * time.Second
 	}
-	tr := &http.Transport{
+	tr := noRedirectTransport{base: &http.Transport{
 		MaxIdleConns:          20,
 		MaxIdleConnsPerHost:   4,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
-	}
+	}}
 	c := &Client{
 		http:        &http.Client{Timeout: timeout, Transport: tr},
 		streamHTTP:  &http.Client{Transport: tr},
@@ -148,6 +149,33 @@ func New(timeout time.Duration) *Client {
 	}
 	c.claimAuto.Store(true)
 	return c
+}
+
+// noRedirectTransport 阻止签名/token 请求跟随重定向，并把 3xx 统一转成 502
+// 错误响应：AK 签名头与 security token 绝不随跳转外泄（插件 redirect:"error"
+// 同口径）。包装在共享 Transport 上，覆盖经过该客户端的全部请求。
+type noRedirectTransport struct{ base http.RoundTripper }
+
+func (t noRedirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		loc := truncateStr(resp.Header.Get("Location"), 200)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
+		resp.Body.Close()
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Status:     "502 Bad Gateway",
+			Proto:      resp.Proto,
+			Header:     http.Header{},
+			Body: io.NopCloser(strings.NewReader(fmt.Sprintf(
+				`{"error":"unexpected redirect %d: %s"}`, resp.StatusCode, loc))),
+			Request: resp.Request,
+		}, nil
+	}
+	return resp, nil
 }
 
 // NewWithChatEndpoint 构造指向自定义 chat-completions 端点的客户端。
@@ -408,6 +436,9 @@ type ChatOptions struct {
 	TopP            *float64
 	Tools           []map[string]any
 	ToolChoice      any
+	// Thinking 未指定（nil）时注入 thinking:{type:"enabled"}（官方客户端行为）；
+	// 显式 false 不注入；true 强制注入。
+	Thinking *bool
 }
 
 // CanonicalModel 把用户友好模型 ID 映射为上游 InferHub 注册的模型 ID。
@@ -463,13 +494,27 @@ func ChatHeadersV2(token, traceID, language string) map[string]string {
 // benefit 由调用方按「发起请求的账号」判定（见 IsBenefitModel）：限时福利模型
 // 必须带 maas_type: benefit 头，判定依据是账号自己的模型目录，不能全局共享。
 func (c *Client) ChatStream(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, benefit bool) (io.ReadCloser, error) {
-	return c.ChatStreamWithOptions(ctx, chatID, messages, traceID, cred, userName, model, ChatOptions{}, benefit)
+	return c.ChatStreamWithOptions(ctx, chatID, messages, traceID, cred, userName, model, ChatOptions{}, benefit, "")
 }
 
 // ChatStreamWithOptions 在基础聊天请求上附加推理等级与采样参数。
-func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, benefit bool) (io.ReadCloser, error) {
+//
+// sessionKey 是账号的稳定标识（如 user_id）：据此派生 x-ot-session-id——网关按
+// 该头统计单账号 3 个并发会话，同账号共用一个会话 id 才不会被槽位 ~1 分钟的
+// 释放滞后顶满（插件实测：不带此头的请求各自占一个新会话）。
+func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messages []ChatMessage, traceID string, cred SignCredential, userName string, model string, opts ChatOptions, benefit bool, sessionKey string) (io.ReadCloser, error) {
 	body := chatBodyV2(chatID, messages, model, opts)
-	return c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionIDFor(chatID), benefit)
+	otSession := ""
+	if sessionKey != "" {
+		otSession = stableSessionID(sessionKey)
+	}
+	return c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionIDFor(chatID), benefit, otSession)
+}
+
+// stableSessionID 由账号稳定标识派生 32 hex 的网关会话 id（跨进程、跨刷新一致）。
+func stableSessionID(key string) string {
+	sum := sha256.Sum256([]byte("codearts-account-session:" + key))
+	return hex.EncodeToString(sum[:16])
 }
 
 // chatBodyV2 组装 /api/v2/chat/completions 请求体（原生 OpenAI 形状）。
@@ -488,7 +533,14 @@ func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOp
 		body["reasoning_effort"] = opts.ReasoningEffort
 	}
 	if opts.MaxTokens != nil {
-		body["max_tokens"] = *opts.MaxTokens
+		mt := *opts.MaxTokens
+		if mt > MaxOutputTokens {
+			mt = MaxOutputTokens // 超上限会被上游拒绝，钳到最大值
+		}
+		body["max_tokens"] = mt
+	}
+	if opts.Thinking == nil || *opts.Thinking {
+		body["thinking"] = map[string]any{"type": "enabled"}
 	}
 	if opts.Temperature != nil {
 		body["temperature"] = *opts.Temperature
@@ -543,42 +595,180 @@ func sessionIDFor(chatID string) string {
 // benefit=true 时追加 maas_type: benefit（限时福利模型路由），该头在签名前设置，
 // 计入 SignedHeaders。
 func (c *Client) SendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken string, benefit bool) (io.ReadCloser, error) {
-	return c.sendChatV2(ctx, body, traceID, cred, userToken, "", "", benefit)
+	return c.sendChatV2(ctx, body, traceID, cred, userToken, "", "", benefit, "")
 }
 
 // sendChatV2 发送聊天请求并返回 SSE 流。
 //
 // chatID/sessionID 作为请求亲和与 prompt cache 标识（不代替 messages 里的语义历史）。
 // benefit 由调用方按账号判定，maas_type 在签名前写入，计入 SignedHeaders。
-func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID string, benefit bool) (io.ReadCloser, error) {
+func (c *Client) sendChatV2(ctx context.Context, body map[string]any, traceID string, cred SignCredential, userToken, chatID, sessionID string, benefit bool, otSession string) (io.ReadCloser, error) {
 	raw, _ := json.Marshal(body)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatEndpoint(), bytes.NewReader(raw))
+	buildReq := func() (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatEndpoint(), bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range ChatHeadersV2(userToken, traceID, "zh-cn") {
+			httpReq.Header.Set(k, v)
+		}
+		if benefit {
+			httpReq.Header.Set(HeaderMaasType, MaasBenefit)
+		}
+		signRequest(httpReq, raw, cred)
+		if chatID != "" {
+			httpReq.Header.Set("Chat-Id", chatID)
+		}
+		if sessionID != "" {
+			httpReq.Header.Set("Session-Id", sessionID)
+		}
+		// 网关按 x-ot-session-id 统计并发会话：同账号全部聊天共用一个稳定会话
+		// id，user-session-id 同值；trace/span 每次随机（官方客户端同形态，
+		// 与 Chat-Id 一样在签名后追加；x-ot-parent-session-id 恒为空，Go 的
+		// net/http 不发送空值头，等价于缺省不携带）。
+		if otSession != "" {
+			httpReq.Header.Set("x-ot-session-id", otSession)
+			httpReq.Header.Set("user-session-id", otSession)
+			httpReq.Header.Set("x-ot-trace-id", randomHexLower(16))
+			httpReq.Header.Set("x-ot-span-id", randomHexLower(8))
+		}
+		return httpReq, nil
+	}
+	// 网关排队（插件同口径）：429 + queue-status:queued + trace-id → 轮询
+	// trace-queues 直到 promoted 再重发；预算耗尽/被移出队列则 DELETE 退出。
+	deadline := time.Now().Add(QueueBudget)
+	for {
+		httpReq, err := buildReq()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.streamHTTP.Do(httpReq)
+		if err != nil {
+			return nil, err
+		}
+		if queued := queueInfoOf(resp); queued != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if !ctxDeadlineOk(ctx, deadline) {
+				return nil, &ApiError{Code: http.StatusTooManyRequests, Status: http.StatusTooManyRequests,
+					Message: "排队等待超时或已被移出队列，请稍后再试", Path: EpChatV2}
+			}
+			if c.waitInQueue(ctx, cred, queued, deadline) == "promoted" {
+				continue
+			}
+			return nil, &ApiError{Code: http.StatusTooManyRequests, Status: http.StatusTooManyRequests,
+				Message: "排队等待超时或已被移出队列，请稍后再试", Path: EpChatV2}
+		}
+		if resp.StatusCode >= 400 {
+			rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(rawBody), 200), Path: EpChatV2}
+		}
+		return preflightSSE(resp.Body)
+	}
+}
+
+// ctxDeadlineOk 报告当前时刻是否仍在排队预算与请求截止之内。
+func ctxDeadlineOk(ctx context.Context, deadline time.Time) bool {
+	if time.Now().After(deadline) {
+		return false
+	}
+	if d, ok := ctx.Deadline(); ok && time.Now().After(d) {
+		return false
+	}
+	return ctx.Err() == nil
+}
+
+// queuedTrace 是一次「网关已排队」应答（429 + queue-status:queued + trace-id）。
+type queuedTrace struct {
+	TraceID    string
+	RetryAfter time.Duration
+}
+
+func queueInfoOf(resp *http.Response) *queuedTrace {
+	if !strings.EqualFold(strings.TrimSpace(resp.Header.Get("queue-status")), "queued") {
+		return nil
+	}
+	trace := strings.TrimSpace(resp.Header.Get("trace-id"))
+	if trace == "" {
+		return nil
+	}
+	after := 5 * time.Second
+	if raw := strings.TrimSpace(resp.Header.Get("retry-after")); raw != "" {
+		if sec, err := strconv.ParseFloat(raw, 64); err == nil && sec >= 0 {
+			after = time.Duration(sec * float64(time.Second))
+		}
+	}
+	return &queuedTrace{TraceID: trace, RetryAfter: after}
+}
+
+// waitInQueue 按插件口径在网关队列里等待：每轮隔 retry-after 轮询
+// trace-queues/{id}，promoted 返回可重发；not_found/error/连续 3 次轮询失败/
+// 预算耗尽则 DELETE 退出（返回 gone）。
+func (c *Client) waitInQueue(ctx context.Context, cred SignCredential, q *queuedTrace, deadline time.Time) string {
+	leave := func() {
+		leaveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = c.traceQueueCall(leaveCtx, http.MethodDelete, q.TraceID, cred)
+	}
+	retryAfter := q.RetryAfter
+	failures := 0
+	for {
+		if !ctxDeadlineOk(ctx, deadline) {
+			leave()
+			return "gone"
+		}
+		select {
+		case <-time.After(retryAfter):
+		case <-ctx.Done():
+			leave()
+			return "gone"
+		}
+		raw, err := c.traceQueueCall(ctx, http.MethodGet, q.TraceID, cred)
+		if err != nil {
+			failures++
+			if failures >= 3 {
+				leave()
+				return "gone"
+			}
+			retryAfter = 2 * time.Second
+			continue
+		}
+		var status struct {
+			Status     string   `json:"status"`
+			RetryAfter *float64 `json:"retry_after"`
+		}
+		_ = json.Unmarshal(raw, &status)
+		switch status.Status {
+		case "promoted":
+			return "promoted"
+		case "not_found", "error":
+			leave()
+			return "gone"
+		}
+		if status.RetryAfter != nil && *status.RetryAfter >= 0 {
+			retryAfter = time.Duration(*status.RetryAfter * float64(time.Second))
+		}
+	}
+}
+
+// traceQueueCall 对排队 trace 做一次签名 GET/DELETE（空 body，无额外路由头）。
+func (c *Client) traceQueueCall(ctx context.Context, method, traceID string, cred SignCredential) (json.RawMessage, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.snapURL(EpTraceQueues+"/"+traceID), nil)
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range ChatHeadersV2(userToken, traceID, "zh-cn") {
-		httpReq.Header.Set(k, v)
-	}
-	if benefit {
-		httpReq.Header.Set(HeaderMaasType, MaasBenefit)
-	}
-	signRequest(httpReq, raw, cred)
-	if chatID != "" {
-		httpReq.Header.Set("Chat-Id", chatID)
-	}
-	if sessionID != "" {
-		httpReq.Header.Set("Session-Id", sessionID)
-	}
-	resp, err := c.streamHTTP.Do(httpReq)
+	signRequest(req, []byte{}, cred)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
-		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(rawBody), 200), Path: EpChatV2}
+		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 200), Path: EpTraceQueues}
 	}
-	return preflightSSE(resp.Body)
+	return json.RawMessage(raw), nil
 }
 
 type replayReadCloser struct {
@@ -816,4 +1006,86 @@ func (c *Client) getSigned(ctx context.Context, urlStr string, cred SignCredenti
 		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: req.URL.Path}
 	}
 	return raw, nil
+}
+
+// AccountIdentity 是从 refresh_token JWT 里解出的账号身份。
+type AccountIdentity struct {
+	ID   string
+	Name string
+}
+
+// IdentityFromRefreshToken 解析 refresh_token（JWT）user_profile claim 里的
+// 账号身份，纯本地、不发网络请求。
+//
+// STS 的 code/refresh 响应不带用户字段，官方客户端就是从这里拿身份的。口径
+// 与插件 accountIdentityOf 一致：id 依次取 principal_urn / account_name /
+// account_id / user_id；name 依次取 user_name / account_name / domain_name；
+// user_profile 可能是对象，也可能是再编码过一层的 base64 JSON 字符串。
+// 解不出返回零值。
+func IdentityFromRefreshToken(token string) AccountIdentity {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return AccountIdentity{}
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		if raw, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
+			return AccountIdentity{}
+		}
+	}
+	var payload struct {
+		UserProfile json.RawMessage `json:"user_profile"`
+	}
+	if json.Unmarshal(raw, &payload) != nil || len(payload.UserProfile) == 0 {
+		return AccountIdentity{}
+	}
+	if id, name := userProfileIdentity(payload.UserProfile); id != "" || name != "" {
+		return AccountIdentity{ID: id, Name: name}
+	}
+	return AccountIdentity{}
+}
+
+// userProfileIdentity 从 user_profile 字段解出 (id, name)；字段本身可能是
+// 对象，也可能是 JSON 字符串或再 base64 一层的 JSON 字符串。
+func userProfileIdentity(raw json.RawMessage) (string, string) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", ""
+	}
+	if id, name := parseUserProfile(raw); id != "" || name != "" {
+		return id, name
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return "", ""
+	}
+	if strings.HasPrefix(strings.TrimSpace(text), "{") {
+		if id, name := parseUserProfile([]byte(text)); id != "" || name != "" {
+			return id, name
+		}
+	}
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawURLEncoding, base64.RawStdEncoding} {
+		if decoded, err := enc.DecodeString(strings.TrimSpace(text)); err == nil {
+			if id, name := parseUserProfile(decoded); id != "" || name != "" {
+				return id, name
+			}
+		}
+	}
+	return "", ""
+}
+
+func parseUserProfile(raw []byte) (string, string) {
+	var profile struct {
+		PrincipalURN string `json:"principal_urn"`
+		AccountName  string `json:"account_name"`
+		AccountID    string `json:"account_id"`
+		UserID       string `json:"user_id"`
+		UserName     string `json:"user_name"`
+		DomainName   string `json:"domain_name"`
+	}
+	if json.Unmarshal(raw, &profile) != nil {
+		return "", ""
+	}
+	id := firstNonEmpty(profile.PrincipalURN, profile.AccountName, profile.AccountID, profile.UserID)
+	name := firstNonEmpty(profile.UserName, profile.AccountName, profile.DomainName)
+	return id, name
 }

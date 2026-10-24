@@ -18,6 +18,7 @@ type Config struct {
 	Pool              *pool.Pool
 	Enabled           bool
 	CreditsAutoClaim  bool          // 自动领取每日签到/新手积分，与 Token 模型福利独立
+	BenefitAutoClaim  bool          // 自动领取每日限时福利（免费模型当天可用，默认 true）
 	PollInterval      time.Duration // 默认 30m
 	RefreshSkew       time.Duration // 到期前多久刷新，默认 30m
 	KeepaliveInterval time.Duration // 保活心跳间隔，默认 15m
@@ -87,6 +88,14 @@ func (s *Scheduler) Tick(ctx context.Context) {
 				} else if remaining <= s.cfg.RefreshSkew {
 					log.Printf("token refreshed account=%s new_remaining=%s", acct.Name,
 						acct.Auth.Remaining().Round(time.Minute))
+				}
+			}
+			if s.cfg.BenefitAutoClaim {
+				claimCtx, cancel := context.WithTimeout(ctx, time.Minute)
+				claimed := s.cfg.Pool.EnsureBenefitClaimed(claimCtx, acct.Name)
+				cancel()
+				if !claimed {
+					log.Printf("benefit claim account=%s not claimed today (免费模型可能 4004)", acct.Name)
 				}
 			}
 			if s.cfg.CreditsAutoClaim {

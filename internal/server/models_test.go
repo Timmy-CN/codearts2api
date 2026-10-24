@@ -95,14 +95,17 @@ func TestModelEntriesAliasesStaticAndBenefit(t *testing.T) {
 		t.Error("福利模型应在 /v1/models 标记 benefit")
 	}
 
-	// 动态目录缺失的模型由静态表补位（精确 ID + 小写别名），福利标记跟随静态表。
-	for _, want := range []string{"Qwen3-VL-235B", "qwen3-vl-235b", "glm-5.3-flash", "deepseek-v4-flash-0731"} {
+	// 动态目录缺失的模型由静态表补位（精确 ID + 小写别名），福利标记跟随静态表；
+	// -vl 视觉模型不进列表（与官方 IDE/插件一致，上下文小、无 tool call）。
+	for _, want := range []string{"glm-5.3-flash", "deepseek-v4-flash-0731"} {
 		if byID[want] == nil {
 			t.Errorf("静态兜底缺少 %q", want)
 		}
 	}
-	if byID["qwen3-vl-235b"]["benefit"] != nil {
-		t.Error("内置模型不应标记 benefit")
+	for _, hidden := range []string{"Qwen3-VL-235B", "qwen3-vl-235b"} {
+		if byID[hidden] != nil {
+			t.Errorf("视觉模型 %q 应从目录隐藏", hidden)
+		}
 	}
 	if byID["glm-5.3-flash"]["benefit"] != true {
 		t.Error("静态兜底里的福利模型应保留 benefit 标记")

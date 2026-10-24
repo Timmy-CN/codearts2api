@@ -49,6 +49,7 @@ type chatRequest struct {
 	Tools           []map[string]any
 	ToolChoice      toolChoiceOpenAI
 	ConversationID  string
+	Thinking        *bool
 }
 
 // parseChatRequest 解析并校验请求体。
@@ -68,6 +69,7 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		Messages            []json.RawMessage `json:"messages"`
 		Tools               []map[string]any  `json:"tools"`
 		ToolChoice          json.RawMessage   `json:"tool_choice"`
+		Thinking            json.RawMessage   `json:"thinking"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parse request: %w", err)
@@ -86,6 +88,7 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		ConversationID:  raw.ConversationID,
 		Tools:           raw.Tools,
 		ToolChoice:      parseToolChoice(raw.ToolChoice),
+		Thinking:        parseThinking(raw.Thinking),
 	}
 	if raw.MaxCompletionTokens != nil {
 		req.MaxTokens = raw.MaxCompletionTokens
@@ -316,4 +319,30 @@ func conversationIDFor(req *chatRequest, headerValue string) string {
 		}
 	}
 	return ""
+}
+
+// parseThinking 解析可选的 thinking 字段：布尔或 {type:"enabled"/"disabled"}
+// 对象。nil = 未指定（服务端按官方客户端行为注入 thinking:{type:"enabled"}）。
+func parseThinking(raw json.RawMessage) *bool {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		return &b
+	}
+	var obj struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		switch strings.ToLower(strings.TrimSpace(obj.Type)) {
+		case "enabled":
+			enabled := true
+			return &enabled
+		case "disabled":
+			disabled := false
+			return &disabled
+		}
+	}
+	return nil
 }

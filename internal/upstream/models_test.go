@@ -267,3 +267,107 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 		t.Fatalf("关闭自动领取后不应再提交 claim，claims=%d", gotClaims)
 	}
 }
+
+// agent-center 目录解析出消耗系数（credit[].ratio_display）与推理标记
+// （model_parameters.thinking_type）。
+func TestFetchAgentModelsParsesRateAndReasoning(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/agent-center/agents/useragents":
+			_, _ = io.WriteString(w, `{"agents":[{"agent_id":"a2","agent_name":"CodeAgent","show_in_ide":true,"alias":{"alias_zh_cn":"智能体"}}]}`)
+		case "/v1/agent-center/agents/detail":
+			_, _ = io.WriteString(w, `{"gpts":{"models":[
+				{"model_id":"glm-5.2","credit":[{"ratio_display":"1.50x"}],
+				 "model_parameters":{"model_id":"glm-5.2","context_window":202752,"max_tokens":16384}},
+				{"model_id":"glm-5.3-flash",
+				 "model_parameters":{"model_id":"glm-5.3-flash","context_window":1048576,"max_tokens":65536,"thinking_type":"enabled"}}]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := New(5 * time.Second)
+	c.snapBase = srv.URL
+
+	infos, err := c.fetchAgentModels(SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "st"})
+	if err != nil {
+		t.Fatalf("fetchAgentModels: %v", err)
+	}
+	if len(infos) != 2 {
+		t.Fatalf("infos = %+v", infos)
+	}
+	if infos[0].Rate != 1.5 || infos[0].Reasoning {
+		t.Fatalf("glm-5.2 应 rate=1.5 无推理标记: %+v", infos[0])
+	}
+	if !infos[1].Reasoning || infos[1].Rate != 0 {
+		t.Fatalf("glm-5.3-flash 应 reasoning=true 无倍率: %+v", infos[1])
+	}
+}
+
+// 三个来源（agent-center/builtin/福利网关）都隐藏 -vl 视觉模型（大小写不敏感）。
+func TestVisionModelsFilteredFromAllSources(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/agent-center/agents/useragents":
+			_, _ = io.WriteString(w, `{"agents":[{"agent_id":"a2","agent_name":"CodeAgent","show_in_ide":true,"alias":{"alias_zh_cn":"智能体"}}]}`)
+		case "/v1/agent-center/agents/detail":
+			_, _ = io.WriteString(w, `{"gpts":{"models":[
+				{"model_id":"glm-5.2","model_parameters":{"model_id":"glm-5.2","context_window":202752}},
+				{"model_id":"Qwen3-VL-235B","model_parameters":{"model_id":"Qwen3-VL-235B","context_window":131072}},
+				{"model_id":"kimi-k2.6-vl"}]}}`)
+		case "/v1/model/builtin":
+			_, _ = io.WriteString(w, `{"builtinModels":[
+				{"model_id":"GLM-5.1","context_window":131072},
+				{"model_id":"qwen3.6-27b-vl","context_window":131072}]}`)
+		case "/api/v1/gateway/config":
+			_, _ = io.WriteString(w, `{"error_code":"0000","result":{"models":[
+				{"model_id":"glm-5.3-flash","context_window":1048576},
+				{"model_id":"kimi-k2.6-vl","context_window":131072}]}}`)
+		case "/api/v1/benefit/claim":
+			_, _ = io.WriteString(w, `{"error_code":"0000"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := New(5 * time.Second)
+	c.snapBase = srv.URL
+	c.benefitBase = srv.URL
+	cred := SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "st"}
+
+	agents, err := c.fetchAgentModels(cred)
+	if err != nil {
+		t.Fatalf("agent models: %v", err)
+	}
+	for _, m := range agents {
+		if isVisionModel(m.ID) {
+			t.Fatalf("agent 目录泄漏视觉模型: %s", m.ID)
+		}
+	}
+	if len(agents) != 1 {
+		t.Fatalf("agent 目录应只剩 glm-5.2: %+v", agents)
+	}
+	builtin, err := c.fetchBuiltinModels("acct-vl", cred)
+	if err != nil {
+		t.Fatalf("builtin models: %v", err)
+	}
+	for _, m := range builtin {
+		if isVisionModel(m.ID) {
+			t.Fatalf("builtin 目录泄漏视觉模型: %s", m.ID)
+		}
+	}
+	benefit, err := c.fetchBenefitModels("acct-vl", cred)
+	if err != nil {
+		t.Fatalf("benefit models: %v", err)
+	}
+	for _, m := range benefit {
+		if isVisionModel(m.ID) {
+			t.Fatalf("福利目录泄漏视觉模型: %s", m.ID)
+		}
+	}
+	if len(benefit) != 1 {
+		t.Fatalf("福利目录应只剩 glm-5.3-flash: %+v", benefit)
+	}
+}

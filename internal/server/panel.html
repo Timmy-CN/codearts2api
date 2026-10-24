@@ -171,12 +171,13 @@ input{font:inherit}
           <tr>
             <th>账号</th>
             <th>签到 / 新手福利</th>
+            <th>积分</th>
             <th>状态</th>
             <th>原因 / 冷却至</th>
             <th>操作</th>
           </tr>
         </thead>
-        <tbody id="acctBody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+        <tbody id="acctBody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -307,7 +308,7 @@ function render(data){
   const body = $("acctBody");
   const accounts = data.accounts || [];
   if (!accounts.length){
-    body.innerHTML = `<tr><td colspan="5" class="empty">暂无账号。点击右上角 <b>授权登录</b> 添加，或服务器运行 <span class="mono">./login.sh</span></td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="empty">暂无账号。点击右上角 <b>授权登录</b> 添加，或服务器运行 <span class="mono">./login.sh</span></td></tr>`;
   } else {
     body.innerHTML = accounts.map(a => {
       const reason = a.reason || "—";
@@ -318,6 +319,7 @@ function render(data){
           <div class="mono muted" title="${escapeHtml(a.uid||"")}">${escapeHtml(shortUID(a.uid))}</div>
         </td>
         <td><div class="${a.checkin && !a.checkin.ok ? 'muted' : ''}">${escapeHtml(a.checkin?.message || "尚未查询")}</div><div class="muted" style="font-size:11px">${a.checkin ? escapeHtml(fmtTime(a.checkin.checked_at)) : ""}</div></td>
+        <td class="muted">${escapeHtml(a.credits_text || (a.credits_total >= 0 ? "已查询" : "—"))}</td>
         <td>${statusBadge(a)}${a.err_count?` <span class="badge info">err ${a.err_count}</span>`:""}</td>
         <td><div class="muted">${escapeHtml(reason)}</div><div class="mono muted" style="font-size:11px">${escapeHtml(until)}</div></td>
         <td><div class="row-actions">

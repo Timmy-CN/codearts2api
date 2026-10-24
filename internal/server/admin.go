@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"codearts2api/internal/auth"
+	"codearts2api/internal/upstream"
 )
 
 // adminOverview 面板总览。
@@ -64,13 +66,15 @@ func readUIDBody(r *http.Request) (uidBody, error) {
 }
 
 type actionResult struct {
-	UID     string  `json:"uid"`
-	OK      bool    `json:"ok"`
-	Credits float64 `json:"credits,omitempty"`
-	Message string  `json:"message,omitempty"`
+	UID     string                   `json:"uid"`
+	OK      bool                     `json:"ok"`
+	Credits float64                  `json:"credits,omitempty"`
+	Message string                   `json:"message,omitempty"`
+	Credit  *upstream.CreditSnapshot `json:"credit,omitempty"`
 }
 
-// adminCredits 保留旧路由，校验/刷新登录态；不把它当作真实积分查询。
+// adminCredits 校验/刷新登录态并顺带拉取真实积分快照（桶、到期批次、每日
+// token 池），面板据此展示每账号积分与到期。
 func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 	body, err := readUIDBody(r)
 	if err != nil {
@@ -99,7 +103,16 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 				res.Message = "token invalid"
 			} else {
 				res.OK = true
-				res.Message = "ok"
+				// 真实积分快照（缓存 10 分钟）；查询失败不影响校验结果。
+				ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+				snap, cerr := h.cfg.Pool.AccountCredits(ctx, uid)
+				cancel()
+				if cerr != nil {
+					res.Message = "ok（积分查询失败：" + cerr.Error() + "）"
+				} else {
+					res.Credit = snap
+					res.Message = creditSummary(snap)
+				}
 			}
 			mu.Lock()
 			results = append(results, res)
@@ -108,8 +121,37 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": allOK(results), "message": summaryMsg("刷新状态", results), "results": results,
+		"ok": allOK(results), "message": summaryMsg("积分查询", results), "results": results,
 	})
+}
+
+// creditSummary 生成一行人类可读的积分摘要。
+func creditSummary(snap *upstream.CreditSnapshot) string {
+	text := "ok"
+	total := 0.0
+	expiring := 0.0
+	for _, b := range snap.Buckets {
+		if b.Name == upstream.MetricTotalCredit {
+			total = b.Remain
+		}
+		expiring += b.Expiring
+	}
+	if total > 0 || len(snap.Buckets) > 0 {
+		text += fmt.Sprintf("；总积分余 %.0f", total)
+		if snap.ResetsAt > 0 {
+			text += "，" + time.UnixMilli(snap.ResetsAt).Format("01-02 15:04") + " 重置"
+		}
+		if expiring > 0 {
+			text += fmt.Sprintf("，%.0f 即将过期", expiring)
+		}
+	}
+	if snap.TokenPool != nil && snap.TokenPool.DailyLimit > 0 {
+		text += fmt.Sprintf("；今日免费额度 %.0f/%.0f tokens", snap.TokenPool.DailyUsed, snap.TokenPool.DailyLimit)
+	}
+	if snap.Error != "" {
+		text += "（部分数据缺失：" + snap.Error + "）"
+	}
+	return text
 }
 
 // adminCheckin 领取指定账号或全部启用账号的签到/新手活动积分。

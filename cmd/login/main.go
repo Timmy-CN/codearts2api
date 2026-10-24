@@ -119,6 +119,27 @@ loginLoop:
 		}
 	}
 
+	// STS 的 code 换取响应不带用户字段（插件同口径从 refresh_token JWT 的
+	// user_profile 解身份）：缺身份时先解 JWT，再退回 STS 查询，避免落成
+	// codearts-unknown.json——账号池按 UserID 索引，空 id 的账号加载不到。
+	if tok.UserID == "" || tok.UserName == "" {
+		ident := upstream.IdentityFromRefreshToken(tok.RefreshToken)
+		if ident.ID == "" || ident.Name == "" {
+			cred := upstream.SignCredential{
+				SecurityToken:   tok.Credentials.SecurityToken,
+				AccessKeyID:     tok.Credentials.AccessKeyID,
+				SecretAccessKey: tok.Credentials.SecretAccessKey,
+			}
+			if uid, uname, _ := identityLookup(cred); uid != "" {
+				ident.ID = firstNonEmptyStr(ident.ID, uid)
+				ident.Name = firstNonEmptyStr(ident.Name, uname)
+			}
+		}
+		tok.UserID = firstNonEmptyStr(ident.ID, tok.UserID)
+		tok.UserName = firstNonEmptyStr(ident.Name, tok.UserName)
+		log.Printf("identity resolved user_id=%q name=%q", tok.UserID, tok.UserName)
+	}
+
 	// 4. 落盘
 	cred := tok.Credentials
 	a := auth.New(tok.UserID, tok.UserName, tok.DomainID,
@@ -134,6 +155,31 @@ loginLoop:
 	if cred.Expiration != "" {
 		fmt.Printf("STS 有效期至：%s（到期前自动 refresh 续期）\n", cred.Expiration)
 	}
+}
+
+// identityLookup 用刚拿到的 STS 凭证查账号身份（caller-identity → current/user），
+// 与 WebUI 登录路径同口径。
+func identityLookup(cred upstream.SignCredential) (uid, name, domain string) {
+	if uid, name, domain, err := upstream.CallerIdentity(cred); err == nil && uid != "" {
+		return uid, name, domain
+	} else if err != nil {
+		log.Printf("identity lookup caller-identity: %v", err)
+	}
+	if uid, name, domain, err := upstream.CurrentUser(cred); err == nil && uid != "" {
+		return uid, name, domain
+	} else if err != nil {
+		log.Printf("identity lookup current/user: %v", err)
+	}
+	return "", "", ""
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // callbackState 保存 portal 回调里下发的 secret。

@@ -89,6 +89,10 @@ go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，
 
 关闭后福利模型仍会出现在 `/v1/models`，但调用必然失败。
 
+领取覆盖三处（都按北京日幂等）：模型发现时（上节）、watchdog 每轮对每个启用
+账号补领、以及聊天请求被 `InferHub.4004/4005 benefit not found` 拒绝时先补领
+一次再重发同一账号（跨北京日/领取过期的兜底）。
+
 ### 模型可用性探测
 
 `/v1/models` 只列**真实可用**的模型：上游的模型发现（agent-center / builtin / 福利
@@ -96,6 +100,9 @@ go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，
 等返回 `InferHub.002002009.404`）。服务会周期性用一条最小请求探测并缓存结论，
 真实请求失败也会被学习（`not registered` / `benefit not found` 记为账号能力问题，
 不会给健康账号记错误冷却）。探测结果缓存 30 分钟。
+
+`-vl` 视觉模型（如 `Qwen3-VL-235B`、`kimi-k2.6-vl`）在三个发现来源里统一隐藏：
+上下文小、无 tool call，官方 IDE 与插件都不把它们作为 agent 主模型。
 
 ### API Key 必填
 
@@ -115,6 +122,27 @@ export CA2A_API_KEY=$(openssl rand -hex 24)
 `client_id` 与 `dpop_private_key`；刷新时原样复用并写回轮转后的新 refresh_token。
 若手工换过 `login_client_id`，老账号仍按自己记录的 client_id 刷新。
 
+refresh_token 是一次性的：若它已被 `cmd/apply`、`cmd/login` 或另一个实例换新，
+本进程刷新会撞「has been used」——此时服务会重读磁盘上的凭证文件并改用最新的
+refresh_token 重试一次，而不是直接禁用账号。
+
+### 上游请求行为对齐（与官方客户端/插件同口径）
+
+- **网关排队**：上游 `429 + queue-status: queued + trace-id` 时，按 `retry-after`
+  轮询 `concurrency/trace-queues/{id}` 直到 `promoted` 再重发；预算 300s、连续
+  3 次轮询失败或被移出队列则 DELETE 退出并回 429。
+- **thinking 注入**：请求未显式给 `thinking` 时注入 `{"type":"enabled"}`（思考链
+  才会进 `reasoning_content`）；被模型以参数错误拒绝（400 文案点名 thinking）时
+  自动摘除重发一次。可用 `thinking: false` 显式关闭。
+- **max_tokens 钳制**：超过 65536 一律钳到上限，避免上游拒绝。
+- **不跟随重定向**：签名请求与令牌请求遇到 3xx 一律转 502，AK 签名头与
+  security token 绝不随跳转外泄。
+- **稳定会话头**：每个账号的聊天共用一个由 user_id 派生的稳定
+  `x-ot-session-id`（`user-session-id` 同值，`x-ot-trace-id`/`x-ot-span-id`
+  每次随机）——网关按这个头统计单账号 3 个并发会话，共用会话 id 才不会被
+  槽位 ~1 分钟的释放滞后顶满（插件实测：不带此头的请求各自占一个新会话）。
+  因此 `max_concurrent` 可以按需调高而不再默认撞 `TM.00001041`。
+
 ### 每日签到与新手积分
 
 服务默认在启动和每次 watchdog 轮询时检查活动，自动领取每日签到积分及
@@ -126,8 +154,20 @@ export CA2A_API_KEY=$(openssl rand -hex 24)
 
 `credits_auto_claim: false` 或 `CA2A_CREDITS_AUTO_CLAIM=0` 可关闭自动领取，
 `watch.enabled: false` 会关闭整个轮询。手动签到仍可使用。
-这项活动与 `benefit_auto_claim` 的模型 Token 福利独立；面板显示最近领取结果，
-不把领取量或健康账号数当作积分余额。`credit.sh` 查登录态，`apply.sh` 仅续期。
+这项活动与 `benefit_auto_claim` 的模型 Token 福利独立；面板显示最近领取结果。
+`credit.sh` 查登录态，`apply.sh` 仅续期。
+
+### 积分余额查询
+
+`POST /admin/api/credits`（面板「校验」按钮）在登录态校验之外返回真实积分快照：
+`GET /snap-manager/v1/statistics/plugin` 的四个积分桶（总/基础/按需/赠送）、
+`snap-manager/v1/package/credit/page` 与 `ops/credit` 的到期批次（月度重置 =
+套餐批次最早到期；签到积分按各自到期时间列出）、opengw 的每日免费 token 池。
+快照缓存 10 分钟，签到成功后强制重读；批次/token 池读不到时快照照常返回并在
+`error` 字段说明。面板账号表新增「积分」列（来自最近一次查询的缓存）。
+
+`/v1/models` 与面板模型目录带 `rate`（agent-center `credit[].ratio_display`
+消耗系数）与 `reasoning`（`model_parameters.thinking_type` 存在）标记。
 
 当前[官方每日签到活动](https://support.huaweicloud.com/offers-codeartsagent/codeartsagent_offers_0004.html)
 为已升级积分计费的用户每日发放 1000 积分，30 天有效，活动截止于

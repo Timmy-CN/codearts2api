@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,18 @@ type ModelInfo struct {
 	// Benefit 限时福利（免费套餐）模型：聊天需带 maas_type: benefit 头。
 	Benefit bool   `json:"benefit,omitempty"`
 	Desc    string `json:"desc,omitempty"`
+	// Rate 积分消耗系数（agent-center credit[].ratio_display，"1.50x"→1.5）。
+	Rate float64 `json:"rate,omitempty"`
+	// Reasoning 推理模型（agent-center model_parameters.thinking_type 存在）。
+	Reasoning bool `json:"reasoning,omitempty"`
+}
+
+// IsVisionModel 识别 -vl 视觉模型（大小写不敏感：后缀 -vl 或中缀 -vl-，如
+// kimi-k2.6-vl）。这类模型上下文小、无 tool call，插件与官方 IDE 都不把它们
+// 作为 agent 主模型展示。
+func isVisionModel(id string) bool {
+	lower := strings.ToLower(id)
+	return strings.Contains(lower, "-vl-") || strings.HasSuffix(lower, "-vl")
 }
 
 // 冷启动种子：福利套餐轮换后新增的模型在首次发现前也要走福利路由，
@@ -58,7 +71,6 @@ var seedBenefitModels = []string{
 var seedKnownModels = []string{
 	"GLM-5.2", "GLM-5.2-ArkTS-SPARK", "GLM-5.1", "GLM-4.7",
 	"OpenPangu-2.0-Pro", "OpenPangu-2.0-Flash",
-	"Qwen3-VL-235B", "Qwen3.5-397B-A17B-VL", "Qwen3.6-27B-VL",
 }
 
 var seedBenefit = func() map[string]bool {
@@ -347,11 +359,18 @@ func (c *Client) fetchAgentModels(cred SignCredential) ([]ModelInfo, error) {
 				ModelAlias string `json:"model_alias"`
 				ModelName  string `json:"model_name"`
 				ModelID    string `json:"model_id"`
-				Params     struct {
-					ContextWindow int64  `json:"context_window"`
-					MaxTokens     int64  `json:"max_tokens"`
-					ModelID       string `json:"model_id"`
-					ModelDesc     string `json:"model_desc"`
+				Credit     []struct {
+					RatioDisplay string `json:"ratio_display"`
+				} `json:"credit"`
+				Params struct {
+					ContextWindow int64   `json:"context_window"`
+					MaxTokens     int64   `json:"max_tokens"`
+					ModelID       string  `json:"model_id"`
+					ModelDesc     string  `json:"model_desc"`
+					ThinkingType  *string `json:"thinking_type"`
+					Credit        []struct {
+						RatioDisplay string `json:"ratio_display"`
+					} `json:"credit"`
 				} `json:"model_parameters"`
 			} `json:"models"`
 		} `json:"gpts"`
@@ -362,7 +381,7 @@ func (c *Client) fetchAgentModels(cred SignCredential) ([]ModelInfo, error) {
 	out := make([]ModelInfo, 0, len(detail.Gpts.Models))
 	for _, m := range detail.Gpts.Models {
 		id := firstNonEmpty(m.ModelName, m.ModelID, m.ModelAlias, m.Params.ModelID)
-		if id == "" {
+		if id == "" || isVisionModel(id) {
 			continue
 		}
 		out = append(out, ModelInfo{
@@ -371,6 +390,8 @@ func (c *Client) fetchAgentModels(cred SignCredential) ([]ModelInfo, error) {
 			ContextWindow: m.Params.ContextWindow,
 			MaxTokens:     m.Params.MaxTokens,
 			Desc:          m.Params.ModelDesc,
+			Rate:          creditRateOf(append(m.Credit, m.Params.Credit...)),
+			Reasoning:     m.Params.ThinkingType != nil,
 		})
 	}
 	return out, nil
@@ -461,7 +482,7 @@ func (c *Client) fetchBuiltinModels(accountID string, cred SignCredential) ([]Mo
 	infos := make([]ModelInfo, 0, len(out.BuiltinModels))
 	for _, m := range out.BuiltinModels {
 		id := firstNonEmpty(m.ModelID, m.ModelName)
-		if id == "" {
+		if id == "" || isVisionModel(id) {
 			continue
 		}
 		infos = append(infos, ModelInfo{ID: id, Name: id, ContextWindow: m.ContextWindow, MaxTokens: m.MaxTokens, Desc: m.ModelDesc})
@@ -568,7 +589,7 @@ func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]Mo
 	infos := make([]ModelInfo, 0, len(out.Result.Models))
 	for _, m := range out.Result.Models {
 		id := firstNonEmpty(m.ModelID, m.ModelName)
-		if id == "" {
+		if id == "" || isVisionModel(id) {
 			continue
 		}
 		infos = append(infos, ModelInfo{
@@ -578,4 +599,21 @@ func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]Mo
 		})
 	}
 	return infos, nil
+}
+
+// creditRateOf 从 credit[].ratio_display（如 "1.50x"）解析消耗系数；解不出返回 0。
+func creditRateOf(credits []struct {
+	RatioDisplay string `json:"ratio_display"`
+}) float64 {
+	for _, c := range credits {
+		text := strings.TrimSpace(c.RatioDisplay)
+		if text == "" {
+			continue
+		}
+		text = strings.TrimSuffix(strings.ToLower(text), "x")
+		if v, err := strconv.ParseFloat(text, 64); err == nil && v > 0 {
+			return v
+		}
+	}
+	return 0
 }
