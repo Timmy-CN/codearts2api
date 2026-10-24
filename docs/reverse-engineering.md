@@ -147,8 +147,10 @@ Body：
 - 聊天路由：**同一** `POST {snap}/api/v2/chat/completions`，福利模型需追加请求头
   `maas_type: benefit`（renderer 检测 `isFreeBenefit` 添加，经 kernel `KERNEL_LLM_FORWARD_HEADERS`
   转发）。无此头报 `InferHub.002002009.404 model is not registered`；有头正常流式。
-- agent 选择：`useragents?offset=0&limit=100&is_primary_agent=true` 后取
-  `agent_name=="CodeAgent" && alias.alias_zh_cn=="智能体" && show_in_ide`（退化 primary/首个）。
+- agent 选择（对齐插件 agentCandidates）：`useragents?offset=0&limit=100`（不带
+  is_primary_agent）后按 `original_id ∈ {"build","CodeAgent"}` 排序，其余 agent
+  随后，末尾固定兜底 id `a8bcb36232554267a5142361cc25a393`；detail 依次尝试至多
+  3 个，返回非空模型列表的 agent 被记住（state.agentId 同口径）。
 - 内置补充接口：`GET {snap}/v1/model/builtin`（`Agent-Type: PromptCenter`）→ `{builtinModels:[...]}`。
 - 模型 ID 区分大小写；福利网关返回小写，`CanonicalModel` 做大小写不敏感归一。
 

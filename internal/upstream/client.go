@@ -123,6 +123,8 @@ type Client struct {
 	// 分来源失败退避：同一账号的 builtin/福利接口打不通时短期内不再重试，
 	// 避免每次 /v1/models 刷新都空等超时。
 	srcMu   sync.Mutex
+	agentMu sync.Mutex
+	agentID string // 上次成功应答模型列表的 agent id（state.agentId 同口径）
 	srcFail map[string]time.Time
 }
 

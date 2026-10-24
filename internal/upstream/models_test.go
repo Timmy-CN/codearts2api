@@ -196,9 +196,12 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 				`{"agent_id":"a2","agent_name":"CodeAgent","show_in_ide":true,"alias":{"alias_zh_cn":"智能体"}}]}`)
 		case "/v1/agent-center/agents/detail":
 			if r.URL.Query().Get("agent_id") != "a2" {
-				t.Errorf("应选中 CodeAgent（alias 智能体 + show_in_ide），got=%s", r.URL.RawQuery)
+				// 候选按列表顺序尝试（插件 agentCandidates 口径）：a1 无模型
+				// 列表应 404 并落到 a2。
+				w.WriteHeader(http.StatusNotFound)
+				return
 			}
-			_, _ = io.WriteString(w, `{"gpts":{"models":[{"model_name":"GLM-5.2","model_parameters":{"context_window":202752,"max_tokens":8192}}]}}`)
+			_, _ = io.WriteString(w, `{"gpts":{"models":[{"model_id":"GLM-5.2","display_name":"GLM-5.2 显示名","model_parameters":{"model_id":"GLM-5.2","context_window":202752,"max_tokens":8192}}]}}`)
 		case "/v1/model/builtin":
 			if r.Header.Get("Agent-Type") != "PromptCenter" {
 				t.Errorf("builtin 接口需带 Agent-Type: PromptCenter，got=%q", r.Header.Get("Agent-Type"))
@@ -239,6 +242,10 @@ func TestFetchModelsMergesSourcesAndGatesClaim(t *testing.T) {
 	}
 	if byID["glm-5.2"].ContextWindow != 202752 || byID["glm-5.2"].MaxTokens != 8192 {
 		t.Errorf("agent-center 参数未解析：%+v", byID["glm-5.2"])
+	}
+	// id 取 model_parameters.model_id（请求真正可用的名字）；display_name 只做展示名。
+	if byID["glm-5.2"].ID != "GLM-5.2" || byID["glm-5.2"].Name != "GLM-5.2 显示名" {
+		t.Errorf("id/name = %q/%q, 期望 GLM-5.2/显示名", byID["glm-5.2"].ID, byID["glm-5.2"].Name)
 	}
 	mu.Lock()
 	gotClaims := claims
@@ -337,18 +344,25 @@ func TestVisionModelsFilteredFromAllSources(t *testing.T) {
 	c.benefitBase = srv.URL
 	cred := SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "st"}
 
+	// agent 来源：解析结果带排除标记（own/hidden/vision 由合并层排除）。
 	agents, err := c.fetchAgentModels(cred)
 	if err != nil {
 		t.Fatalf("agent models: %v", err)
 	}
+	visionSeen := false
 	for _, m := range agents {
 		if isVisionModel(m.ID) {
-			t.Fatalf("agent 目录泄漏视觉模型: %s", m.ID)
+			visionSeen = true
+			if !m.fromAgent {
+				t.Fatalf("视觉模型 %s 应来自 agent 来源", m.ID)
+			}
 		}
 	}
-	if len(agents) != 1 {
-		t.Fatalf("agent 目录应只剩 glm-5.2: %+v", agents)
+	if !visionSeen {
+		t.Fatal("桩里的视觉模型应出现在 agent 原始解析结果中（排除发生在合并层）")
 	}
+
+	// builtin/福利来源在解析时就地过滤。
 	builtin, err := c.fetchBuiltinModels("acct-vl", cred)
 	if err != nil {
 		t.Fatalf("builtin models: %v", err)
@@ -369,5 +383,24 @@ func TestVisionModelsFilteredFromAllSources(t *testing.T) {
 	}
 	if len(benefit) != 1 {
 		t.Fatalf("福利目录应只剩 glm-5.3-flash: %+v", benefit)
+	}
+
+	// 三路合并：agent-only 的视觉模型不成行，正常模型保留。
+	acct := &auth.Auth{UserID: "acct-vl", AccessKeyID: "AK", SecretAccessKey: "SK", CloudDragonTok: "ST"}
+	infos, err := c.FetchModels(acct)
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	byID := map[string]bool{}
+	for _, mi := range infos {
+		byID[strings.ToLower(mi.ID)] = true
+		if isVisionModel(mi.ID) {
+			t.Fatalf("合并结果泄漏视觉模型: %s", mi.ID)
+		}
+	}
+	for _, want := range []string{"glm-5.2", "glm-5.1", "glm-5.3-flash"} {
+		if !byID[want] {
+			t.Fatalf("合并结果缺 %s: %v", want, byID)
+		}
 	}
 }

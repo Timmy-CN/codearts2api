@@ -51,6 +51,12 @@ type ModelInfo struct {
 	Rate float64 `json:"rate,omitempty"`
 	// Reasoning 推理模型（agent-center model_parameters.thinking_type 存在）。
 	Reasoning bool `json:"reasoning,omitempty"`
+	// Own/Hidden 是 agent-center 的排除标记：第三方/租户自配模型、被下架模型。
+	// 只有 agent 来源的条目会带；这些条目仅用于 enrich 同 id 的已有条目，
+	// 自己不单独成行（插件 merge 排除口径）。fromAgent 仅供合并时判来源。
+	Own       bool `json:"-"`
+	Hidden    bool `json:"-"`
+	fromAgent bool
 }
 
 // IsVisionModel 识别 -vl 视觉模型（大小写不敏感：后缀 -vl 或中缀 -vl-，如
@@ -238,24 +244,37 @@ func lookupKnownModel(id string) (string, bool) {
 // MergeModels 合并多路模型列表：按小写 ID 去重，福利标记取或，参数更全的优先。
 // 结果按小写 ID 排序，保证 /v1/models 输出稳定（缓存刷新前后顺序一致）。
 func MergeModels(sets ...[]ModelInfo) []ModelInfo {
-	merged := map[string]ModelInfo{}
+	type group struct {
+		info       ModelInfo
+		sawVisible bool
+	}
+	merged := map[string]*group{}
 	for _, set := range sets {
 		for _, mi := range set {
 			if mi.ID == "" {
 				continue
 			}
 			key := strings.ToLower(mi.ID)
-			cur, ok := merged[key]
+			// agent 来源的 own/hidden/vision 条目不单独成行（插件 merge 排除
+			// 口径）；与 builtin/福利条目同 id 时仍参与 enrich。
+			excluded := mi.fromAgent && (mi.Own || mi.Hidden || isVisionModel(mi.ID))
+			g, ok := merged[key]
 			if !ok {
-				merged[key] = mi
+				merged[key] = &group{info: mi, sawVisible: !excluded}
 				continue
 			}
-			merged[key] = richerModel(cur, mi)
+			g.info = richerModel(g.info, mi)
+			if !excluded {
+				g.sawVisible = true
+			}
 		}
 	}
 	out := make([]ModelInfo, 0, len(merged))
-	for _, mi := range merged {
-		out = append(out, mi)
+	for _, g := range merged {
+		if !g.sawVisible {
+			continue
+		}
+		out = append(out, g.info)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		li, lj := strings.ToLower(out[i].ID), strings.ToLower(out[j].ID)
@@ -275,6 +294,14 @@ func richerModel(cur, next ModelInfo) ModelInfo {
 		keep, drop = next, cur
 	}
 	keep.Benefit = benefit
+	// agent 目录的 context/output 是模型实际运行限制（插件 enrich 口径）：
+	// 同 id 合并时优先于 builtin 的取值。
+	if drop.fromAgent && drop.ContextWindow > 0 {
+		keep.ContextWindow = drop.ContextWindow
+	}
+	if drop.fromAgent && drop.MaxTokens > 0 {
+		keep.MaxTokens = drop.MaxTokens
+	}
 	if keep.Name == "" {
 		keep.Name = drop.Name
 	}
@@ -287,6 +314,10 @@ func richerModel(cur, next ModelInfo) ModelInfo {
 	if keep.Desc == "" {
 		keep.Desc = drop.Desc
 	}
+	if keep.Rate == 0 {
+		keep.Rate = drop.Rate
+	}
+	keep.Reasoning = keep.Reasoning || drop.Reasoning
 	return keep
 }
 
@@ -340,99 +371,196 @@ func (c *Client) FetchModels(acct *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// fetchAgentModels 官方 fetchAgentModels 等价实现：agent-center detail 的 gpts.models。
-func (c *Client) fetchAgentModels(cred SignCredential) ([]ModelInfo, error) {
-	agentID, err := c.defaultAgentID(cred)
-	if err != nil {
-		return nil, err
-	}
-	if agentID == "" {
-		return nil, fmt.Errorf("no default agent found")
-	}
-	raw, err := c.getSigned(context.Background(), c.snapURL(EpAgentDetail)+"?agent_id="+url.QueryEscape(agentID), cred, true)
-	if err != nil {
-		return nil, err
-	}
-	var detail struct {
-		Gpts struct {
-			Models []struct {
-				ModelAlias string `json:"model_alias"`
-				ModelName  string `json:"model_name"`
-				ModelID    string `json:"model_id"`
-				Credit     []struct {
-					RatioDisplay string `json:"ratio_display"`
-				} `json:"credit"`
-				Params struct {
-					ContextWindow int64   `json:"context_window"`
-					MaxTokens     int64   `json:"max_tokens"`
-					ModelID       string  `json:"model_id"`
-					ModelDesc     string  `json:"model_desc"`
-					ThinkingType  *string `json:"thinking_type"`
-					Credit        []struct {
-						RatioDisplay string `json:"ratio_display"`
-					} `json:"credit"`
-				} `json:"model_parameters"`
-			} `json:"models"`
-		} `json:"gpts"`
-	}
-	if err := json.Unmarshal(raw, &detail); err != nil {
-		return nil, fmt.Errorf("parse models: %w", err)
-	}
-	out := make([]ModelInfo, 0, len(detail.Gpts.Models))
-	for _, m := range detail.Gpts.Models {
-		id := firstNonEmpty(m.ModelName, m.ModelID, m.ModelAlias, m.Params.ModelID)
-		if id == "" || isVisionModel(id) {
-			continue
-		}
-		out = append(out, ModelInfo{
-			ID:            id,
-			Name:          id,
-			ContextWindow: m.Params.ContextWindow,
-			MaxTokens:     m.Params.MaxTokens,
-			Desc:          m.Params.ModelDesc,
-			Rate:          creditRateOf(append(m.Credit, m.Params.Credit...)),
-			Reasoning:     m.Params.ThinkingType != nil,
-		})
-	}
-	return out, nil
+// 主 agent 的判据与兜底 id（插件 MAIN_AGENT_ORIGINAL_IDS / MAIN_AGENT_FALLBACK_ID）：
+// original_id 为 "build"（自主规划与执行）或旧列表的 "CodeAgent"，最后是 IDE
+// 固定的主 agent id。
+var mainAgentOriginalIDs = []string{"build", "CodeAgent"}
+
+const mainAgentFallbackID = "a8bcb36232554267a5142361cc25a393"
+
+// agentDetailTries 是依次尝试读取模型列表的 agent 数上限。
+const agentDetailTries = 3
+
+// agentModelRaw 是 agents/detail → gpts.models 的原始条目。
+type agentModelRaw struct {
+	ModelAlias     string `json:"model_alias"`
+	ModelName      string `json:"model_name"`
+	ModelID        string `json:"model_id"`
+	DisplayName    string `json:"display_name"`
+	ModelType      string `json:"model_type"`
+	IsCustomModel  *bool  `json:"is_custom_model"`
+	DisplayEnabled *bool  `json:"display_enabled"`
+	Credit         []struct {
+		RatioDisplay string `json:"ratio_display"`
+	} `json:"credit"`
+	Params struct {
+		ContextWindow  int64   `json:"context_window"`
+		MaxTokens      int64   `json:"max_tokens"`
+		ModelID        string  `json:"model_id"`
+		ModelDesc      string  `json:"model_desc"`
+		ThinkingType   *string `json:"thinking_type"`
+		DisplayEnabled *bool   `json:"display_enabled"`
+		Credit         []struct {
+			RatioDisplay string `json:"ratio_display"`
+		} `json:"credit"`
+	} `json:"model_parameters"`
 }
 
-// defaultAgentID 拉取用户 agent 列表，返回 CodeAgent 的 agent_id。
-// 过滤条件与官方客户端一致：agent_name=="CodeAgent" && alias.alias_zh_cn=="智能体" && show_in_ide，
-// 退化为 is_primary_agent，再退化为首个。
-func (c *Client) defaultAgentID(cred SignCredential) (string, error) {
-	raw, err := c.getSigned(context.Background(), c.snapURL(EpAgentList)+"?offset=0&limit=100&is_primary_agent=true", cred, true)
+// parseAgentModel 解析一条 agent 模型（插件 parseAgentModel 同口径）：
+// id 取 model_parameters.model_id（请求真正可用的名字），name 取
+// display_name → model_name；own/hidden 标记交给合并层决定是否成行。
+func parseAgentModel(m agentModelRaw) (ModelInfo, bool) {
+	id := firstNonEmpty(m.Params.ModelID, m.ModelID)
+	if id == "" {
+		return ModelInfo{}, false
+	}
+	output := m.Params.MaxTokens
+	if output > MaxOutputTokens {
+		output = MaxOutputTokens
+	}
+	return ModelInfo{
+		ID:            id,
+		Name:          firstNonEmpty(m.DisplayName, m.ModelName),
+		ContextWindow: m.Params.ContextWindow,
+		MaxTokens:     output,
+		Rate:          creditRateOf(append(m.Credit, m.Params.Credit...)),
+		Reasoning:     m.Params.ThinkingType != nil,
+		Own:           m.ModelType == "third" || m.ModelType == "custom" || (m.IsCustomModel != nil && *m.IsCustomModel),
+		Hidden:        (m.DisplayEnabled != nil && !*m.DisplayEnabled) || (m.Params.DisplayEnabled != nil && !*m.Params.DisplayEnabled),
+		fromAgent:     true,
+	}, true
+}
+
+// agentCandidates 返回要依次询问模型列表的 agent id（最好的在前）：
+// original_id 为 "build"/"CodeAgent" 的主 agent（按列表顺序），其余 agent，
+// 最后是 IDE 固定的主 agent id；去重后由调用方截取前 agentDetailTries 个。
+func (c *Client) agentCandidates(cred SignCredential) []string {
+	fallback := []string{mainAgentFallbackID}
+	raw, err := c.getSigned(context.Background(), c.snapURL(EpAgentList)+"?offset=0&limit=100", cred, true)
 	if err != nil {
-		return "", err
+		return fallback
 	}
 	var out struct {
 		Agents []struct {
-			AgentID   string `json:"agent_id"`
-			AgentName string `json:"agent_name"`
-			Primary   bool   `json:"is_primary_agent"`
-			ShowInIDE bool   `json:"show_in_ide"`
-			Alias     struct {
-				ZhCN string `json:"alias_zh_cn"`
-			} `json:"alias"`
+			AgentID    string `json:"agent_id"`
+			OriginalID string `json:"original_id"`
 		} `json:"agents"`
+		Data struct {
+			Agents []struct {
+				AgentID    string `json:"agent_id"`
+				OriginalID string `json:"original_id"`
+			} `json:"agents"`
+		} `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", fmt.Errorf("parse agents: %w", err)
+	if json.Unmarshal(raw, &out) != nil {
+		return fallback
 	}
-	for _, a := range out.Agents {
-		if a.AgentName == "CodeAgent" && a.Alias.ZhCN == "智能体" && a.ShowInIDE {
-			return a.AgentID, nil
+	agents := out.Agents
+	if len(agents) == 0 {
+		agents = out.Data.Agents
+	}
+	type entry struct {
+		id   string
+		rank int
+	}
+	entries := make([]entry, 0, len(agents))
+	for _, a := range agents {
+		if a.AgentID == "" {
+			continue
 		}
-	}
-	for _, a := range out.Agents {
-		if a.Primary {
-			return a.AgentID, nil
+		probe := a.OriginalID
+		if probe == "" {
+			probe = a.AgentID
 		}
+		rank := len(mainAgentOriginalIDs)
+		for i, want := range mainAgentOriginalIDs {
+			if probe == want {
+				rank = i
+				break
+			}
+		}
+		entries = append(entries, entry{id: a.AgentID, rank: rank})
 	}
-	if len(out.Agents) > 0 {
-		return out.Agents[0].AgentID, nil
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].rank < entries[j].rank })
+	ids := make([]string, 0, len(entries)+1)
+	seen := map[string]bool{}
+	for _, e := range entries {
+		if seen[e.id] {
+			continue
+		}
+		seen[e.id] = true
+		ids = append(ids, e.id)
 	}
-	return "", nil
+	if !seen[mainAgentFallbackID] {
+		ids = append(ids, mainAgentFallbackID)
+	}
+	return ids
+}
+
+// fetchAgentModels 主 agent 的模型列表（agents/detail → gpts.models），携带每个
+// 模型的消耗系数与运行参数。上次成功应答的 agent 优先（state.agentId 同口径，
+// 失败即清空重选）；候选依次尝试，返回非空列表的 agent 被记住。
+func (c *Client) fetchAgentModels(cred SignCredential) ([]ModelInfo, error) {
+	read := func(agentID string) ([]ModelInfo, error) {
+		raw, err := c.getSigned(context.Background(), c.snapURL(EpAgentDetail)+"?agent_id="+url.QueryEscape(agentID), cred, true)
+		if err != nil {
+			return nil, err
+		}
+		var detail struct {
+			Gpts struct {
+				Models []agentModelRaw `json:"models"`
+			} `json:"gpts"`
+		}
+		if err := json.Unmarshal(raw, &detail); err != nil {
+			return nil, fmt.Errorf("parse models: %w", err)
+		}
+		infos := make([]ModelInfo, 0, len(detail.Gpts.Models))
+		for _, m := range detail.Gpts.Models {
+			if mi, ok := parseAgentModel(m); ok {
+				infos = append(infos, mi)
+			}
+		}
+		if len(infos) == 0 {
+			return nil, fmt.Errorf("agent %s returned no models", agentID)
+		}
+		return infos, nil
+	}
+	c.agentMu.Lock()
+	cached := c.agentID
+	c.agentMu.Unlock()
+	if cached != "" {
+		if models, err := read(cached); err == nil {
+			return models, nil
+		}
+		c.setAgentID("")
+	}
+	candidates := c.agentCandidates(cred)
+	if len(candidates) > agentDetailTries {
+		candidates = candidates[:agentDetailTries]
+	}
+	for _, id := range candidates {
+		models, err := read(id)
+		if err != nil {
+			continue
+		}
+		c.setAgentID(id)
+		return models, nil
+	}
+	return nil, fmt.Errorf("no agent returned a model list")
+}
+
+// cachedAgentID 返回记住的 agent id（可能为空）。
+func (c *Client) cachedAgentID() string {
+	c.agentMu.Lock()
+	defer c.agentMu.Unlock()
+	return c.agentID
+}
+
+// setAgentID 记住/清空成功的 agent id。
+func (c *Client) setAgentID(id string) {
+	c.agentMu.Lock()
+	defer c.agentMu.Unlock()
+	c.agentID = id
 }
 
 // fetchBuiltinModels GET /v1/model/builtin（Agent-Type: PromptCenter）。

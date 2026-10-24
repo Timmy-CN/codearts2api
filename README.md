@@ -64,7 +64,8 @@ curl -X POST http://127.0.0.1:7866/v1/chat/completions \
 
 ### 模型列表与限时福利
 
-`/v1/models` 返回上游**精确模型 ID**（区分大小写，如 `GLM-5.2`、`Qwen3-VL-235B`），
+`/v1/models` 返回上游**精确模型 ID**（区分大小写，如 `GLM-5.2`、`glm-5.3-flash`；
+`-vl` 视觉模型与被下架/第三方自配模型不列入，与官方 IDE/插件一致），
 同时为含大写的 ID 补一条小写别名（`glm-5.2`），两者都能用于聊天。限时福利
 （免费套餐）模型额外带 `benefit: true` 标记，聊天时服务端会自动追加上游要求的
 `maas_type: benefit` 请求头（按发起请求的账号判定，多账号套餐不同也不会串——
@@ -167,7 +168,10 @@ refresh_token 重试一次，而不是直接禁用账号。
 `error` 字段说明。面板账号表新增「积分」列（来自最近一次查询的缓存）。
 
 `/v1/models` 与面板模型目录带 `rate`（agent-center `credit[].ratio_display`
-消耗系数）与 `reasoning`（`model_parameters.thinking_type` 存在）标记。
+消耗系数）与 `reasoning`（`model_parameters.thinking_type` 存在）标记。agent
+模型列表的选择与解析与插件同口径：主 agent 按 `original_id`（"build"/CodeAgent，
+兜底 IDE 固定 id）依次尝试并记住成功者；模型 id 取 `model_parameters.model_id`
+（请求真正可用的名字），`display_name` 只做展示名。
 
 当前[官方每日签到活动](https://support.huaweicloud.com/offers-codeartsagent/codeartsagent_offers_0004.html)
 为已升级积分计费的用户每日发放 1000 积分，30 天有效，活动截止于
