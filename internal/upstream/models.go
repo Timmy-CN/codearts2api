@@ -69,9 +69,11 @@ func isVisionModel(id string) bool {
 
 // 冷启动种子：福利套餐轮换后新增的模型在首次发现前也要走福利路由，
 // 少带一次头就是一次 404，宁可多带。发现结果只会在此基础上增补。
-var seedBenefitModels = []string{
-	"deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "glm-5.3-flash",
-}
+// 福利按批次轮换（旧批次 0731/0813/5.3-flash 于 2026-10-25 实测已失效，
+// claim 报 4000 invalid channel；新批次 deepseek-v4.1-flash 实测不带
+// benefit 头即可用），此处仅保留空的发现前预判空间——新批次出现时由
+// 发现结果自动写入各账号目录，无需再改这里。
+var seedBenefitModels = []string{}
 
 // 内置模型种子（大小写归一用，不标记福利）。
 var seedKnownModels = []string{

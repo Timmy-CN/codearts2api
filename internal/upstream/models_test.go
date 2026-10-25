@@ -46,9 +46,11 @@ func TestBenefitIsPerAccount(t *testing.T) {
 	if IsBenefitModel("acct-b", "glm-5.2") {
 		t.Error("内置模型不应走福利路由")
 	}
-	// 目录未知的账号：回退冷启动种子（宁可带头，避免未注册模型 404）。
-	if !IsBenefitModel("acct-unknown", "glm-5.3-flash") {
-		t.Error("目录未发现时应回退种子判定福利模型")
+	// 目录未知的账号：种子表已清空（福利按批次轮换，固化旧批次只会过期；
+	// 2026-10-25 实测旧批次 claim 4000、新批次 deepseek-v4.1-flash 无需
+	// benefit 头）——未发现前不做福利预判，交给发现结果与探测。
+	if IsBenefitModel("acct-unknown", "glm-5.3-flash") {
+		t.Error("种子已清空，过期福利模型不得再误判为福利")
 	}
 	if IsBenefitModel("acct-unknown", "glm-5.2") {
 		t.Error("种子之外的模型不得误判为福利")
@@ -90,9 +92,10 @@ func TestDiscoveredCatalogOverridesSeed(t *testing.T) {
 	if IsBenefitModel("acct-promoted", "GLM-5.2") {
 		t.Error("内置模型不应走福利路由")
 	}
-	// 目录里查不到的种子模型（福利来源失败/未领取）仍要带头，否则上游按未注册模型拒。
-	if !IsBenefitModel("acct-promoted", "deepseek-v4-pro-0813") {
-		t.Error("目录里没有的种子模型应回退种子判定")
+	// 种子已清空：目录里没有的模型不再由种子兜底判福利（旧批次已死，
+	// 带了 benefit 头反而被拒；未发现模型的福利路由交给动态发现）。
+	if IsBenefitModel("acct-promoted", "deepseek-v4-pro-0813") {
+		t.Error("种子已清空，目录外的模型不得再回退种子判定为福利")
 	}
 	// 目录明确标了福利 → 优先级最高。
 	SetAccountModels("acct-promoted2", []ModelInfo{{ID: "glm-5.3-flash", Benefit: true}})

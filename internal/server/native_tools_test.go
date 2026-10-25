@@ -200,6 +200,11 @@ func TestChatCompletionsSignsBenefitHeaderForGLM53Flash(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.Accounts()[0].Client = upstream.NewWithChatEndpoint(5*time.Second, upstreamServer.URL)
+	// 福利路由现在完全由发现结果驱动（静态种子已清空）：给账号写入
+	// 「glm-5.3-flash 是福利模型」的目录，聊天就该带 maas_type: benefit。
+	upstream.SetAccountModels("benefit-account", []upstream.ModelInfo{
+		{ID: "glm-5.3-flash", ContextWindow: 1048576, Benefit: true},
+	})
 	h := NewHandler(Config{Pool: p, DefaultModel: "glm-5.3-flash", MaxRotate: 1})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
@@ -252,7 +257,9 @@ func TestModelsAdvertisesOnlyVerifiedNewCodeArtsModels(t *testing.T) {
 			}
 		}
 	}
-	want := map[string]int{"deepseek-v4-pro-0813": 1048576, "GLM-5.2": 202752}
+	// 静态表已不再固化福利模型（按批次轮换，2026-10-25 实测旧批次 claim 4000）：
+	// 只断言非轮换的实测可用模型。
+	want := map[string]int{"GLM-5.2": 202752}
 	for _, model := range payload.Data {
 		if expected, ok := want[model.ID]; ok {
 			if model.ContextLength != expected {

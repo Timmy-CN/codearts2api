@@ -62,7 +62,7 @@ type staticModel struct {
 	Benefit       bool
 }
 
-// staticModels 静态兜底表：**只放实测确认可用的模型**。
+// staticModels 静态兜底表：**只放实测确认可用、且非按批次轮换的模型**。
 //
 // 上游的模型发现（agent-center / builtin）会列出当前账号未注册的模型，静态表
 // 若照抄发现结果，就等于把 404 写进了兜底路径。以下清单来自 2026-09-15 真实账号
@@ -70,13 +70,14 @@ type staticModel struct {
 //
 //	✅ GLM-5.2、glm-5.2-sft-harmony
 //	❌ GLM-5.2-ArkTS-SPARK、OpenPangu-2.0-Pro、OpenPangu-2.0-Flash（002002009.404）
+//
+// 限时福利模型（deepseek-v4-flash-0731 等）**不进静态表**：福利按批次轮换、
+// 按账号领取（2026-10-25 实测旧批次 claim 已报 error_code=4000 invalid
+// channel），静态固化只会让过期条目反复出现。福利模型完全交给三路动态发现 +
+// 可用性探测（探测层会把不可用的剔掉）。
 var staticModels = []staticModel{
 	{ID: "GLM-5.2", ContextWindow: 202752},
 	{ID: "glm-5.2-sft-harmony", ContextWindow: 131072},
-	// 限时福利（需领取；领取后实测可用，聊天自动带 maas_type: benefit）
-	{ID: "deepseek-v4-flash-0731", ContextWindow: 1048576, Benefit: true},
-	{ID: "deepseek-v4-pro-0813", ContextWindow: 1048576, Benefit: true},
-	{ID: "glm-5.3-flash", ContextWindow: 1048576, Benefit: true},
 }
 
 const (
@@ -796,8 +797,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			// 福利模型报「benefit not found」多半是当天还没领取（北京时间跨天、
 			// 上次领取已过期）。照 magpie 插件口径：先补领一次再重发同一账号。
-			if !benefitRetried && benefit && isBenefitNotClaimedError(serr) {
+			// 门控用错误本身而不是请求前的预判——上游报 4004 就证明该模型走
+			// 福利路由（目录未发现/漏标记的账号也能被这条兜住），重发时带头。
+			if !benefitRetried && isBenefitNotClaimedError(serr) {
 				benefitRetried = true
+				benefit = true
 				log.Printf("benefit model %s rejected account=%s: claiming today's benefit then retrying", model, acct.Name)
 				if h.cfg.Pool.EnsureBenefitClaimed(r.Context(), acct.Name) {
 					continue

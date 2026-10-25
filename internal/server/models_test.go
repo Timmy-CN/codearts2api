@@ -95,20 +95,18 @@ func TestModelEntriesAliasesStaticAndBenefit(t *testing.T) {
 		t.Error("福利模型应在 /v1/models 标记 benefit")
 	}
 
-	// 动态目录缺失的模型由静态表补位（精确 ID + 小写别名），福利标记跟随静态表；
-	// -vl 视觉模型不进列表（与官方 IDE/插件一致，上下文小、无 tool call）。
-	for _, want := range []string{"glm-5.3-flash", "deepseek-v4-flash-0731"} {
-		if byID[want] == nil {
-			t.Errorf("静态兜底缺少 %q", want)
+	// 福利模型不再进静态表（按批次轮换，静态固化只会过期——2026-10-25 实测
+	// 旧批次 claim 已报 4000 invalid channel）：动态目录里没有就不出现。
+	for _, gone := range []string{"glm-5.3-flash", "deepseek-v4-flash-0731"} {
+		if byID[gone] != nil {
+			t.Errorf("过期福利模型 %q 不应再由静态表兜底", gone)
 		}
 	}
+	// -vl 视觉模型不进列表（与官方 IDE/插件一致，上下文小、无 tool call）。
 	for _, hidden := range []string{"Qwen3-VL-235B", "qwen3-vl-235b"} {
 		if byID[hidden] != nil {
 			t.Errorf("视觉模型 %q 应从目录隐藏", hidden)
 		}
-	}
-	if byID["glm-5.3-flash"]["benefit"] != true {
-		t.Error("静态兜底里的福利模型应保留 benefit 标记")
 	}
 
 	// 动态目录整体失败（无账号可用）时仍返回完整静态表 + 别名。
