@@ -1,6 +1,13 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -133,4 +140,162 @@ func keysOf[T any](m map[string]T) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestNotMultimodalIs400 插件 0.2.4：图片发给纯文本模型（InferHub.001001020.406）
+// 归类为 400 请求错误——不重试、不换号、不冷却账号。
+func TestNotMultimodalIs400(t *testing.T) {
+	var chatCalls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// NewWithChatEndpoint(up.URL) 原样 POST 到 /：聊天即此分支
+		if r.Method == http.MethodPost && (r.URL.Path == "/" || strings.HasSuffix(r.URL.Path, "/chat/completions")) {
+			chatCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"error_code\":\"InferHub.001001020.406\",\"error_msg\":\"The request model is not multimodal\"}\n\n"))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/get_detail_param") || strings.HasSuffix(r.URL.Path, "/batch_get_detail_param") {
+			w.Write([]byte(`{}`))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+
+	auths := []*auth.Auth{
+		auth.New("u1", "tester", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", ""),
+		auth.New("u2", "tester2", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", ""),
+	}
+	p, err := pool.New(auths, pool.Config{MaxConcurrent: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, acct := range p.Accounts() {
+		acct.Client = upstream.NewWithChatEndpoint(time.Second, up.URL)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New(time.Second), DefaultModel: "GLM-5.2", MaxRotate: 3})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"GLM-5.2","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,x"}}]}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("not-multimodal 应 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "takes no images") {
+		t.Fatalf("应透出图片拒收文案: %s", rec.Body.String())
+	}
+	if n := chatCalls.Load(); n != 1 {
+		t.Fatalf("不换号不重试, chat calls=%d want 1", n)
+	}
+	// 账号不得被冷却/记错误（请求方的问题）：模型也不得被标为不可用
+	if h.modelKnownUnusable("GLM-5.2") {
+		t.Error("not-multimodal 不得把模型标记为不可用")
+	}
+	if h.modelKnownUnusable("GLM-5.2") {
+		t.Error("not-multimodal 不得把模型标记为不可用")
+	}
+}
+
+// TestToolNameOverLimitShortenedAndRestored 插件 0.2.2（#432）：超 64 字符的
+// 工具名按前 55+`_`+8 位 hash 切短发上游；应答里的调用还原成 agent 原名。
+func TestToolNameOverLimitShortenedAndRestored(t *testing.T) {
+	const longName = "mcp__plugin_android-emulator_android-emulator__android_discover_project" // 71 字符
+	// 真实切法（cutToolName 口径）：前 55 rune + "_" + sha256(longName) 前 8 hex
+	cut := longName[:55] + "_" + func() string {
+		sum := sha256.Sum256([]byte(longName))
+		return hex.EncodeToString(sum[:])[:8]
+	}()
+	var gotTools []map[string]any
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && (r.URL.Path == "/" || strings.HasSuffix(r.URL.Path, "/chat/completions")) {
+			var body struct {
+				Tools []struct {
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				} `json:"tools"`
+				Messages []struct {
+					Role      string `json:"role"`
+					ToolCalls []struct {
+						Function struct {
+							Name string `json:"name"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+					Name string `json:"name"`
+				} `json:"messages"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			for _, tl := range body.Tools {
+				gotTools = append(gotTools, map[string]any{"name": tl.Function.Name})
+			}
+			// 历史里的 assistant.tool_calls 名字应与本次 tools 一致（同切法）
+			w.Header().Set("Content-Type", "text/event-stream")
+			// 上游按切短名回调用；客户端应看到原长名
+			_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"` + cut + `","arguments":"{}"}}]}}]}` + "\n\n"))
+			_, _ = w.Write([]byte(`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+
+	auths := []*auth.Auth{
+		auth.New("u1", "tester", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", ""),
+	}
+	p, err := pool.New(auths, pool.Config{MaxConcurrent: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, acct := range p.Accounts() {
+		acct.Client = upstream.NewWithChatEndpoint(time.Second, up.URL)
+	}
+	h := NewHandler(Config{Pool: p, Upstream: upstream.NewWithChatEndpoint(time.Second, up.URL), DefaultModel: "GLM-5.2", MaxRotate: 1})
+
+	// 第二轮对话：历史里带着原长名的 tool_calls（客户端视角名字从未变过）
+	reqBody := `{"model":"GLM-5.2","messages":[
+		{"role":"user","content":"list projects"},
+		{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"` + longName + `","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"call_1","name":"` + longName + `","content":"[]"}
+	],"tools":[{"type":"function","function":{"name":"` + longName + `","parameters":{"type":"object"}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if len(gotTools) != 1 {
+		t.Fatalf("tools=%v", gotTools)
+	}
+	sent := gotTools[0]["name"].(string)
+	if len([]rune(sent)) > 64 {
+		t.Fatalf("发送名超限: %q (%d)", sent, len([]rune(sent)))
+	}
+	if !strings.HasPrefix(sent, longName[:55]+"_") {
+		t.Fatalf("发送名应为前 55 字符 + hash, got %q", sent)
+	}
+	if sent == longName {
+		t.Fatal("长名应被切短")
+	}
+
+	// 客户端应答里的 tool_calls 名字必须是原长名
+	var out struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Choices) == 0 || len(out.Choices[0].Message.ToolCalls) == 0 {
+		t.Fatalf("应答无 tool_calls: %s", rec.Body.String())
+	}
+	if got := out.Choices[0].Message.ToolCalls[0].Function.Name; got != longName {
+		t.Fatalf("应答名字应还原为原长名, got %q", got)
+	}
 }

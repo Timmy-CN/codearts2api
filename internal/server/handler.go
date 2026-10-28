@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -466,11 +467,14 @@ func modelEntries(infos []upstream.ModelInfo) []map[string]any {
 			ctx = 131072 // 兜底
 		}
 		entry := map[string]any{
-			"id":             id,
-			"object":         "model",
-			"created":        1753600000,
-			"owned_by":       "codearts",
-			"context_length": ctx,
+			"id":       id,
+			"object":   "model",
+			"created":  1753600000,
+			"owned_by": "codearts",
+			// 全模型纯文本（插件 0.2.4）：显式 image:false 而不是留空——
+			// 客户端读作 unknown 会照样发图，被上游 001001020.406 拒。
+			"input_modalities": []string{"text"},
+			"context_length":   ctx,
 		}
 		if maxOut > 0 {
 			entry["max_output_tokens"] = maxOut
@@ -661,6 +665,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// 工具名超 64 字符会被网关拒（InferHub.001001017.413）：切短 + 记映射，
+	// 应答里的调用再还原成 agent 自己的名字（插件 0.2.2 口径，#432）。
+	nameMap := shortenToolNames(req)
 	affinity := r.Header.Get("X-Codearts-Chat-Id")
 	if affinity == "" {
 		affinity = r.Header.Get("X-Session-Affinity")
@@ -838,6 +845,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if serr != nil {
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放槽位再换号
+			if isNotMultimodalError(serr) {
+				// 图片发给了纯文本模型（全部模型纯文本，0.2.4 口径）：请求的
+				// 问题——不重试、不换号、不冷却，直接 400。
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+					"the model takes no images: "+truncateMsg(serr.Error(), 200))
+				return
+			}
 			if isParamInvalidError(serr) {
 				// Client request-param problem: rotating accounts yields the same 400,
 				// and cooling accounts takes down the whole pool for minutes.
@@ -876,11 +890,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if req.IncludeUsage {
 				usage = func(comp *upstream.RawCompletion) map[string]any { return usageEstimate(msgs, comp) }
 			}
-			werr := upstream.StreamCaptureWithUsage(w, rc, model, func(comp *upstream.RawCompletion) {
+			werr := upstream.StreamCaptureWithUsageNamed(w, rc, model, func(comp *upstream.RawCompletion) {
 				storeChat()
 				// 流式传输中定期保活
 				h.cfg.Pool.PingKeepalive(acct.Name)
-			}, usage)
+			}, usage, nameMap)
 			rc.Close()
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 			if werr != nil {
@@ -910,6 +924,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		content, finish := comp.Content, comp.Finish
 		calls := fromUpstreamToolCalls(comp.ToolCalls)
+		restoreToolNames(calls, nameMap)
 		// 原生 tool_calls 是 GLM-5.2 的主路径。仅保留文本协议解析作为
 		// 旧模型/异常输出的兼容兜底，并同时检查 reasoning_content，
 		// 避免模型把工具 JSON 放到思考通道时错误以 stop 结束。
@@ -1179,6 +1194,29 @@ func isParamInvalidError(err error) bool {
 	low := strings.ToLower(message)
 	return strings.Contains(low, "inferhub.001001005") || strings.Contains(low, "request param is invalid")
 }
+
+// isNotMultimodalError 判断是否为「图片发给了纯文本模型」错误（插件 0.2.4
+// 口径，InferHub.001001020.406 "The request model is not multimodal"）：
+// 请求本身的问题——不重试、不换号、不冷却，直接 400。
+func isNotMultimodalError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *upstream.ApiError
+	var streamErr *upstream.UpstreamError
+	var message string
+	switch {
+	case errors.As(err, &apiErr):
+		message = apiErr.Message
+	case errors.As(err, &streamErr):
+		message = streamErr.Code + " " + streamErr.Msg
+	default:
+		return false
+	}
+	return notMultimodalRe.MatchString(message)
+}
+
+var notMultimodalRe = regexp.MustCompile(`(?i)InferHub[.]001001020[.]406|not multimodal`)
 
 // isConcurrentLimitError 判断是否为上游并发会话上限错误（瞬时、可重试）。
 func isConcurrentLimitError(msg string) bool {

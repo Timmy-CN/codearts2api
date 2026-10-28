@@ -4,7 +4,7 @@
 //   - onAnswer:  {"text":"增量","custom_extra_info":...}
 //   - reasoning / thinking: 思考链增量
 //   - done:      {"error_code":"0","error_msg":"","related_question_answer":[...],"response_message_id":"..."}
-//                 related_question_answer 是「相关追问」建议，不是正文，解析时忽略。
+//     related_question_answer 是「相关追问」建议，不是正文，解析时忽略。
 //   - error / heartbeat 等
 //
 // 另：部分帧可能直接给出 structured QA 对象 {question,options,answer}（无 text 字段）。
@@ -131,6 +131,33 @@ func isValidStructuredQA(obj map[string]any) bool {
 
 // deltaFromChunk 从 OpenAI 兼容 chunk 中提取 delta 与 finish_reason。
 // 标准格式：{"choices":[{"delta":{...},"finish_reason":"stop"}]}。
+// restoreStreamToolNames 流内 tool_calls 增量的名字还原：每片的 function.name
+// 在映射里就改写（后续只带 arguments 的分片没有名字，跳过）。
+func restoreStreamToolNames(toolCalls any, names map[string]string) any {
+	if names == nil || toolCalls == nil {
+		return toolCalls
+	}
+	arr, ok := toolCalls.([]any)
+	if !ok {
+		return toolCalls
+	}
+	for _, item := range arr {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := entry["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		if orig, hit := names[name]; hit {
+			fn["name"] = orig
+		}
+	}
+	return arr
+}
+
 func deltaFromChunk(payload map[string]any) (delta map[string]any, finishReason string) {
 	if d, ok := payload["delta"].(map[string]any); ok {
 		return d, ""
@@ -473,6 +500,13 @@ func StreamCapture(w http.ResponseWriter, r io.Reader, model string, onDone func
 // StreamCaptureWithUsage emits a final usage chunk when usageFor is non-nil.
 // usageFor can supply an estimate when the upstream omits usage.
 func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, onDone func(*RawCompletion), usageFor func(*RawCompletion) map[string]any) error {
+	return StreamCaptureWithUsageNamed(w, r, model, onDone, usageFor, nil)
+}
+
+// StreamCaptureWithUsageNamed 同上，另带工具名还原映射（发送名 → agent 原名）：
+// 流内透传的 tool_calls 增量里点名的工具会被改写回 agent 的名字（插件
+// restoreToolNames 的流式口径）。nil = 不改写。
+func StreamCaptureWithUsageNamed(w http.ResponseWriter, r io.Reader, model string, onDone func(*RawCompletion), usageFor func(*RawCompletion) map[string]any, toolNames map[string]string) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -602,7 +636,7 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 				delta["reasoning_content"] = reason.String()[beforeReason:]
 			}
 			if toolCalls, ok := nativeDelta["tool_calls"]; ok {
-				delta["tool_calls"] = toolCalls
+				delta["tool_calls"] = restoreStreamToolNames(toolCalls, toolNames)
 			}
 			if len(delta) > 0 || nativeFinish != "" {
 				if werr := writeChunk(delta, nativeFinish); werr != nil {
