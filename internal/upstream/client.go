@@ -1014,6 +1014,9 @@ func (c *Client) getSigned(ctx context.Context, urlStr string, cred SignCredenti
 type AccountIdentity struct {
 	ID   string
 	Name string
+	// IAMUserID 是读手机号用的 IAM 用户 id（user_profile.principal_id，退到
+	// user_id）；解不出为空。
+	IAMUserID string
 }
 
 // IdentityFromRefreshToken 解析 refresh_token（JWT）user_profile claim 里的
@@ -1021,63 +1024,67 @@ type AccountIdentity struct {
 //
 // STS 的 code/refresh 响应不带用户字段，官方客户端就是从这里拿身份的。口径
 // 与插件 accountIdentityOf 一致：id 依次取 principal_urn / account_name /
-// account_id / user_id；name 依次取 user_name / account_name / domain_name；
-// user_profile 可能是对象，也可能是再编码过一层的 base64 JSON 字符串。
-// 解不出返回零值。
+// account_id / user_id；name 依次取 user_name / account_name / domain_name，
+// 但 IAM 内部 ID 形状永远不当 name（插件 0.2.6）；user_profile 可能是对象，
+// 也可能是再编码过一层的 base64 JSON 字符串。解不出返回零值。
 func IdentityFromRefreshToken(token string) AccountIdentity {
+	id, name, principalID := parseUserProfileFromToken(token)
+	return AccountIdentity{ID: id, Name: name, IAMUserID: principalID}
+}
+
+// parseUserProfileFromToken 解出 (id, name, principal_id)；第三个供读手机号用。
+func parseUserProfileFromToken(token string) (string, string, string) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return AccountIdentity{}
+		return "", "", ""
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		if raw, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
-			return AccountIdentity{}
+			return "", "", ""
 		}
 	}
 	var payload struct {
 		UserProfile json.RawMessage `json:"user_profile"`
 	}
 	if json.Unmarshal(raw, &payload) != nil || len(payload.UserProfile) == 0 {
-		return AccountIdentity{}
+		return "", "", ""
 	}
-	if id, name := userProfileIdentity(payload.UserProfile); id != "" || name != "" {
-		return AccountIdentity{ID: id, Name: name}
-	}
-	return AccountIdentity{}
+	return userProfileIdentity(payload.UserProfile)
 }
 
-// userProfileIdentity 从 user_profile 字段解出 (id, name)；字段本身可能是
-// 对象，也可能是 JSON 字符串或再 base64 一层的 JSON 字符串。
-func userProfileIdentity(raw json.RawMessage) (string, string) {
+// userProfileIdentity 从 user_profile 字段解出 (id, name, principal_id)；字段
+// 本身可能是对象，也可能是 JSON 字符串或再 base64 一层的 JSON 字符串。
+func userProfileIdentity(raw json.RawMessage) (string, string, string) {
 	if len(raw) == 0 || string(raw) == "null" {
-		return "", ""
+		return "", "", ""
 	}
-	if id, name := parseUserProfile(raw); id != "" || name != "" {
-		return id, name
+	if id, name, pid := parseUserProfile(raw); id != "" || name != "" {
+		return id, name, pid
 	}
 	var text string
 	if json.Unmarshal(raw, &text) != nil {
-		return "", ""
+		return "", "", ""
 	}
 	if strings.HasPrefix(strings.TrimSpace(text), "{") {
-		if id, name := parseUserProfile([]byte(text)); id != "" || name != "" {
-			return id, name
+		if id, name, pid := parseUserProfile([]byte(text)); id != "" || name != "" {
+			return id, name, pid
 		}
 	}
 	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawURLEncoding, base64.RawStdEncoding} {
 		if decoded, err := enc.DecodeString(strings.TrimSpace(text)); err == nil {
-			if id, name := parseUserProfile(decoded); id != "" || name != "" {
-				return id, name
+			if id, name, pid := parseUserProfile(decoded); id != "" || name != "" {
+				return id, name, pid
 			}
 		}
 	}
-	return "", ""
+	return "", "", ""
 }
 
-func parseUserProfile(raw []byte) (string, string) {
+func parseUserProfile(raw []byte) (string, string, string) {
 	var profile struct {
 		PrincipalURN string `json:"principal_urn"`
+		PrincipalID  string `json:"principal_id"`
 		AccountName  string `json:"account_name"`
 		AccountID    string `json:"account_id"`
 		UserID       string `json:"user_id"`
@@ -1085,9 +1092,10 @@ func parseUserProfile(raw []byte) (string, string) {
 		DomainName   string `json:"domain_name"`
 	}
 	if json.Unmarshal(raw, &profile) != nil {
-		return "", ""
+		return "", "", ""
 	}
 	id := firstNonEmpty(profile.PrincipalURN, profile.AccountName, profile.AccountID, profile.UserID)
-	name := firstNonEmpty(profile.UserName, profile.AccountName, profile.DomainName)
-	return id, name
+	name := DisplayNameOf(profile.UserName, profile.AccountName, profile.DomainName)
+	iamUserID := firstNonEmpty(profile.PrincipalID, profile.UserID)
+	return id, name, iamUserID
 }

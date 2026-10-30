@@ -329,6 +329,15 @@ func (h *Handler) saveLoginResult(tok *upstream.TokenResponse, codeVerifier stri
 			}
 		}
 	}
+	// 插件 0.2.5：显示名用 IAM 读回的脱敏手机号（尽力而为，失败不影响登录）。
+	a.SetUserPhone(upstream.FetchAccountPhone(upstream.SignCredential{
+		AccessKeyID:     a.AccessKeyID,
+		SecretAccessKey: a.SecretAccessKey,
+		SecurityToken:   a.CloudDragonTok,
+	}, upstream.IAMUserIDFromRefreshToken(tok.RefreshToken)))
+	// 插件 0.2.6：IAM 内部 ID 形状永远不当名字；手机号在展示时优先。
+	a.UserName = upstream.DisplayNameOf(a.UserName)
+	tok.UserName = upstream.DisplayNameOf(a.Phone(), a.UserName)
 	if err := auth.SaveNew(h.cfg.AuthDir, a); err != nil {
 		return err
 	}

@@ -23,3 +23,20 @@ func TestFileNameSanitizesUnsafeChars(t *testing.T) {
 		}
 	}
 }
+
+// 新凭证落盘 user_phone 后重读仍在；旧凭证没有该字段时 Phone 为空（插件 0.2.5）。
+func TestUserPhoneRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	a := New("u1", "张三", "d", "tok", "ak", "sk", "2026-12-01T00:00:00Z", "", "")
+	a.SetUserPhone("138****8000")
+	if err := SaveNew(dir, a); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadDir(dir)
+	if err != nil || len(loaded) != 1 {
+		t.Fatalf("LoadDir = %v, %v", loaded, err)
+	}
+	if got := loaded[0].Phone(); got != "138****8000" {
+		t.Fatalf("phone = %q", got)
+	}
+}

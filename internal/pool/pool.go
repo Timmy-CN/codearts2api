@@ -213,7 +213,7 @@ func (p *Pool) List() []map[string]any {
 		out = append(out, map[string]any{
 			"name":              a.Name,
 			"uid":               a.UID,
-			"nickname":          a.UserName,
+			"nickname":          nicknameOf(a),
 			"user_name":         a.UserName,
 			"default_model":     a.DefaultModel,
 			"credits":           int64(0), // 保留旧字段；真实积分见 credits_total/credits_text
@@ -235,6 +235,32 @@ func (p *Pool) List() []map[string]any {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i]["uid"].(string) < out[j]["uid"].(string) })
 	return out
+}
+
+// nicknameOf 面板显示名：脱敏手机号优先，其次过滤掉 IAM 内部 ID 形状的名字
+// （插件 0.2.5/0.2.6）；都没有时返回空串，面板按「未命名」回退。
+func nicknameOf(a *Account) string {
+	if a == nil {
+		return ""
+	}
+	phone := ""
+	if a.Auth != nil {
+		phone = a.Auth.Phone()
+	}
+	return upstream.DisplayNameOf(phone, a.UserName)
+}
+
+// readAccountPhone 用账号自己的 STS 凭据读 IAM 手机号并写入凭证（只改内存）。
+func readAccountPhone(a *auth.Auth) {
+	if a == nil {
+		return
+	}
+	token, ak, sk := a.Credentials()
+	phone := upstream.FetchAccountPhone(
+		upstream.SignCredential{AccessKeyID: ak, SecretAccessKey: sk, SecurityToken: token},
+		upstream.IAMUserIDFromRefreshToken(a.Refresh()),
+	)
+	a.SetUserPhone(phone)
 }
 
 // Stats 汇总。
@@ -704,6 +730,16 @@ func (p *Pool) RefreshToken(name string) error {
 		resp.RefreshToken,
 	); err != nil {
 		return fmt.Errorf("save token: %w", err)
+	}
+	// 插件 0.2.5：旧凭证（0.2.5 之前登录的）没有手机号，续期时补读一次并落盘；
+	// 读到就写回，读不到不重试（结果已按 IAM 用户缓存 6h）。
+	if authz.Phone() == "" {
+		readAccountPhone(authz)
+		if authz.Phone() != "" {
+			if err := authz.Save(); err != nil {
+				log.Printf("pool: save account phone failed account=%s: %v", name, err)
+			}
+		}
 	}
 	acct.mu.Lock()
 	acct.disabled = false

@@ -12,6 +12,10 @@ const (
 	PortalHost = "https://codearts.huaweicloud.com/portal"
 	// IAMHost IAM 令牌/STS（备用）。
 	IAMHost = "https://iam.myhuaweicloud.com"
+	// IAMRegionHost 华北-四 IAM（插件 0.2.5 读手机号用的就是它）。
+	IAMRegionHost = "https://iam.cn-north-4.myhuaweicloud.com"
+	// EpIAMUser IAM 用户详情（GET {IAMRegionHost}/v3.0/OS-USER/users/{principal_id}）。
+	EpIAMUser = "/v3.0/OS-USER/users/"
 	// STSHost 临时 AK/SK。
 	STSHost = "https://sts.cn-north-4.myhuaweicloud.com"
 

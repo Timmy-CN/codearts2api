@@ -15,6 +15,9 @@ import (
 type Auth struct {
 	UserID          string `json:"user_id"`
 	UserName        string `json:"user_name"`
+	// UserPhone 是 IAM 读回的脱敏手机号（138****8000，插件 0.2.5），只作
+	// 显示名；空表示还没读到（旧凭证）或读失败。
+	UserPhone       string `json:"user_phone,omitempty"`
 	DomainID        string `json:"domain_id"`
 	CloudDragonTok  string `json:"cloud_dragon_token"` // = STS security_token，chat 用 x-auth-token
 	AccessKeyID     string `json:"access_key_id"`
@@ -174,6 +177,26 @@ func (a *Auth) UpdateCredentials(token, accessKeyID, secretAccessKey, expiration
 	return saveLocked(a.path, a)
 }
 
+// Phone 返回脱敏手机号（显示名用，可能为空）。
+func (a *Auth) Phone() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.UserPhone
+}
+
+// SetUserPhone 记录脱敏手机号；只改内存，落盘由调用方的 Save 完成。
+func (a *Auth) SetUserPhone(phone string) {
+	if a == nil || phone == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.UserPhone = phone
+}
+
 // UpdateIdentity 回填登录身份字段（WebUI 回调可能拿不到 user_id/user_name）。
 func (a *Auth) UpdateIdentity(userID, userName, domainID string) error {
 	a.mu.Lock()
@@ -216,6 +239,9 @@ func (a *Auth) Reload() error {
 	a.Expiration = fresh.Expiration
 	a.RefreshToken = fresh.RefreshToken
 	a.UpdatedAt = fresh.UpdatedAt
+	if fresh.UserPhone != "" {
+		a.UserPhone = fresh.UserPhone
+	}
 	if fresh.ClientID != "" {
 		a.ClientID = fresh.ClientID
 	}

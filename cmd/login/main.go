@@ -119,26 +119,31 @@ loginLoop:
 		}
 	}
 
-	// STS 的 code 换取响应不带用户字段（插件同口径从 refresh_token JWT 的
-	// user_profile 解身份）：缺身份时先解 JWT，再退回 STS 查询，避免落成
-	// codearts-unknown.json——账号池按 UserID 索引，空 id 的账号加载不到。
-	if tok.UserID == "" || tok.UserName == "" {
-		ident := upstream.IdentityFromRefreshToken(tok.RefreshToken)
-		if ident.ID == "" || ident.Name == "" {
-			cred := upstream.SignCredential{
-				SecurityToken:   tok.Credentials.SecurityToken,
-				AccessKeyID:     tok.Credentials.AccessKeyID,
-				SecretAccessKey: tok.Credentials.SecretAccessKey,
-			}
-			if uid, uname, _ := identityLookup(cred); uid != "" {
-				ident.ID = firstNonEmptyStr(ident.ID, uid)
-				ident.Name = firstNonEmptyStr(ident.Name, uname)
-			}
+	// STS 的 code 换取响应不带用户字段（插件 0.2.5/0.2.6 口径：从 refresh_token
+	// JWT 的 user_profile 解身份，name 只用「人能分辨」的值，IAM 内部 ID 形状
+	// 永远不当名字）。缺身份时再退回 STS 查询，避免落成 codearts-unknown.json
+	// ——账号池按 UserID 索引，空 id 的账号加载不到。
+	ident := upstream.IdentityFromRefreshToken(tok.RefreshToken)
+	if ident.ID == "" || ident.Name == "" {
+		cred := upstream.SignCredential{
+			SecurityToken:   tok.Credentials.SecurityToken,
+			AccessKeyID:     tok.Credentials.AccessKeyID,
+			SecretAccessKey: tok.Credentials.SecretAccessKey,
 		}
-		tok.UserID = firstNonEmptyStr(ident.ID, tok.UserID)
-		tok.UserName = firstNonEmptyStr(ident.Name, tok.UserName)
-		log.Printf("identity resolved user_id=%q name=%q", tok.UserID, tok.UserName)
+		if uid, uname, _ := identityLookup(cred); uid != "" {
+			ident.ID = firstNonEmptyStr(ident.ID, uid)
+			ident.Name = firstNonEmptyStr(ident.Name, uname)
+		}
 	}
+	// 显示名用 IAM 读回的脱敏手机号（尽力而为，读不到就留空）。
+	phone := upstream.FetchAccountPhone(upstream.SignCredential{
+		SecurityToken:   tok.Credentials.SecurityToken,
+		AccessKeyID:     tok.Credentials.AccessKeyID,
+		SecretAccessKey: tok.Credentials.SecretAccessKey,
+	}, ident.IAMUserID)
+	tok.UserID = firstNonEmptyStr(ident.ID, tok.UserID)
+	tok.UserName = upstream.DisplayNameOf(phone, ident.Name, tok.UserName)
+	log.Printf("identity resolved user_id=%q name=%q phone=%q", tok.UserID, tok.UserName, phone)
 
 	// 4. 落盘
 	cred := tok.Credentials
@@ -147,6 +152,7 @@ loginLoop:
 		cred.Expiration, tok.RefreshToken, verifier)
 	a.SetClientID(cfg.ClientID)
 	a.SetDPoPPrivateKey(dpopPrivateJWK)
+	a.SetUserPhone(phone)
 	if err := auth.SaveNew(*authDir, a); err != nil {
 		log.Fatalf("save auth: %v", err)
 	}
