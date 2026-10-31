@@ -12,15 +12,15 @@ import (
 	"codearts2api/internal/upstream"
 )
 
-type checkinClientFunc func(context.Context, upstream.SignCredential) (upstream.CheckinResult, error)
+type checkinClientFunc func(context.Context, upstream.SignCredential, []int) (upstream.CheckinResult, error)
 
-func (f checkinClientFunc) Checkin(ctx context.Context, cred upstream.SignCredential) (upstream.CheckinResult, error) {
-	return f(ctx, cred)
+func (f checkinClientFunc) Checkin(ctx context.Context, cred upstream.SignCredential, unconfirmed []int) (upstream.CheckinResult, error) {
+	return f(ctx, cred, unconfirmed)
 }
 
 func TestCheckinSerializesAndKeepsInferenceHealthy(t *testing.T) {
 	var calls, active, peak atomic.Int32
-	client := checkinClientFunc(func(ctx context.Context, cred upstream.SignCredential) (upstream.CheckinResult, error) {
+	client := checkinClientFunc(func(ctx context.Context, cred upstream.SignCredential, _ []int) (upstream.CheckinResult, error) {
 		calls.Add(1)
 		n := active.Add(1)
 		if n > peak.Load() {

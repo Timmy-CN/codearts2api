@@ -105,7 +105,7 @@ func TestAccountCreditsPartialFailure(t *testing.T) {
 // 签到成功后积分缓存失效，下一次查询强制重读。
 func TestCheckinInvalidatesCredits(t *testing.T) {
 	fake := &creditsClientFunc{}
-	checkin := checkinClientFunc(func(ctx context.Context, cred upstream.SignCredential) (upstream.CheckinResult, error) {
+	checkin := checkinClientFunc(func(ctx context.Context, cred upstream.SignCredential, _ []int) (upstream.CheckinResult, error) {
 		return upstream.CheckinResult{OK: true, Message: "+1000"}, nil
 	})
 	a := auth.New("u1", "user", "domain", "token", "ak", "sk", time.Now().Add(2*time.Hour).Format(time.RFC3339), "", "")

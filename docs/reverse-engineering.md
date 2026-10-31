@@ -115,12 +115,14 @@ Body：
 活动接口位于 `https://snap-access.cn-north-4.myhuaweicloud.com` 根路径，
 **不带 `/snap-manager`**；使用 AK/SK 签名、`X-Security-Token`、`Agent-Type: PromptCenter`。
 
-- `GET /v1/ops/delivery?channel=IDE`：`{code:0,data:{items:[...]}}`。按活动 ID
-  选择每日签到（1）和新用户（4），不自动参与学生认证、邀请等其他活动。
+- `GET /v1/ops/delivery?channel=IDE`：`{code:0,data:{items:[...]}}`。每日签到按
+  `type == "USER_LOGIN"` 选择（没有 `type` 的旧响应退回活动 ID 1）；新用户（4）
+  是 Go 侧保留的扩展，不自动参与学生认证、邀请等其他活动。
 - `POST /v1/ops/claim`：`{campaignId,channel:"IDE",idempotentKey:"claim_<ID>_<毫秒时间戳>"}`。
 - `POST /v1/ops/confirm`：`{campaignId}`。
-- `ELIGIBLE` 且 `claimable=true` 才领取；`CLAIMED` 只补确认；
-  `CONFIRMED` / `CONSUMED` 已完成。HTTP 200 仍必须检查业务 `code=0`。
+- `ELIGIBLE` 且 `claimable=true` 才领取；claim 应答 `benefit.id` 为 `null` 或缺 id
+  时不确认；`CLAIMED` 只在「本服务当天 claim 且 confirm 失败」时补确认（IDE 留下
+  的 pending 不碰）；`CONFIRMED` / `CONSUMED` 已完成。HTTP 200 仍必须检查业务 `code=0`。
 - 活动起止时间取 `extra.startTime/endTime`；金额取 `pendingTotalAmount/benefitAmount`。
   delivery 还含活动跳转票据，日志/面板只使用脱敏字段，不保存或显示这些票据。
 - 调度器和手动签到按账号串行执行；失败不影响推理账号健康，下一轮继续查询。

@@ -16,7 +16,7 @@ import (
 
 type adminCheckinClient struct{ calls int }
 
-func (c *adminCheckinClient) Checkin(context.Context, upstream.SignCredential) (upstream.CheckinResult, error) {
+func (c *adminCheckinClient) Checkin(context.Context, upstream.SignCredential, []int) (upstream.CheckinResult, error) {
 	c.calls++
 	return upstream.CheckinResult{OK: true, Credits: 1000, Message: "领取成功（1000 积分）"}, nil
 }

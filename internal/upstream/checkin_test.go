@@ -12,18 +12,24 @@ import (
 	"time"
 )
 
+// 状态机 + 确认口径：只有本次 claim 失败的那条才补 confirm（插件 0.3.0）。
 func TestCheckinTransitionsAndEligibility(t *testing.T) {
 	tests := []struct {
 		name, status string
 		claimable    bool
 		end          string
 		start        string
+		own          []int
 		wantOK       bool
 		wantWrites   []string
 		wantCredits  float64
+		wantMessage  string
 	}{
-		{name: "fresh", status: "ELIGIBLE", claimable: true, wantOK: true, wantWrites: []string{EpCreditClaim, EpCreditConfirm}, wantCredits: 1000},
-		{name: "unconfirmed", status: "CLAIMED", wantOK: true, wantWrites: []string{EpCreditConfirm}},
+		{name: "fresh", status: "ELIGIBLE", claimable: true, wantOK: true,
+			wantWrites: []string{EpCreditClaim, EpCreditConfirm}, wantCredits: 1000},
+		{name: "claimed not ours", status: "CLAIMED", wantOK: true, wantMessage: "非本服务发起"},
+		{name: "claimed ours", status: "CLAIMED", own: []int{1}, wantOK: true,
+			wantWrites: []string{EpCreditConfirm}, wantCredits: 1000},
 		{name: "confirmed", status: "CONFIRMED", wantOK: true},
 		{name: "consumed", status: "CONSUMED", wantOK: true},
 		{name: "not eligible", wantOK: true},
@@ -45,8 +51,8 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 						t.Errorf("wrong delivery URL: %s", r.URL)
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"items": []any{
-						map[string]any{"campaignId": 1, "title": "daily", "status": tc.status, "claimable": tc.claimable, "benefitUnit": "CREDIT", "benefitAmount": 1000, "pendingTotalAmount": 1000, "extra": map[string]string{"endTime": tc.end, "startTime": tc.start}},
-						map[string]any{"campaignId": 2, "claimable": true, "status": "ELIGIBLE"},
+						map[string]any{"campaignId": 1, "type": "USER_LOGIN", "title": "daily", "status": tc.status, "claimable": tc.claimable, "benefitUnit": "CREDIT", "benefitAmount": 1000, "pendingTotalAmount": 1000, "extra": map[string]string{"endTime": tc.end, "startTime": tc.start}},
+						map[string]any{"campaignId": 2, "type": "OTHER", "claimable": true, "status": "ELIGIBLE"},
 						map[string]any{"campaignId": 3, "claimable": true, "status": "ELIGIBLE"},
 					}}})
 					return
@@ -64,35 +70,71 @@ func TestCheckinTransitionsAndEligibility(t *testing.T) {
 					if body["channel"] != "IDE" || !strings.HasPrefix(key, "claim_1_") {
 						t.Errorf("wrong claim body: %v", body)
 					}
+					_, _ = fmt.Fprint(w, `{"code":0,"data":{"benefit":{"id":123}}}`)
+					return
 				}
 				_, _ = fmt.Fprint(w, `{"code":0,"message":"ok"}`)
 			}))
 			defer srv.Close()
 			c := New(time.Second)
 			c.snapBase = srv.URL
-			res, err := c.Checkin(context.Background(), SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "token"})
+			res, err := c.Checkin(context.Background(), SignCredential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "token"}, tc.own)
 			if err != nil || res.OK != tc.wantOK || res.Credits != tc.wantCredits || !reflect.DeepEqual(writes, tc.wantWrites) {
 				t.Fatalf("result=%+v err=%v writes=%v, want ok=%t credits=%g writes=%v", res, err, writes, tc.wantOK, tc.wantCredits, tc.wantWrites)
+			}
+			if tc.wantMessage != "" && !strings.Contains(res.Message, tc.wantMessage) {
+				t.Fatalf("message = %q, want substring %q", res.Message, tc.wantMessage)
 			}
 		})
 	}
 }
 
+// claim 应答没有可确认票据（缺 id / id:null）时不 confirm，也不算 pending。
+func TestCheckinDoesNotConfirmWithoutTicket(t *testing.T) {
+	for name, claim := range map[string]string{
+		"missing data": `{"code":0}`,
+		"null id":      `{"code":0,"data":{"benefit":{"id":null}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			confirms := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case EpCreditDelivery:
+					_, _ = fmt.Fprint(w, `{"code":0,"data":{"items":[{"campaignId":1,"type":"USER_LOGIN","status":"ELIGIBLE","claimable":true,"benefitAmount":500}]}}`)
+				case EpCreditClaim:
+					_, _ = fmt.Fprint(w, claim)
+				case EpCreditConfirm:
+					confirms++
+					_, _ = fmt.Fprint(w, `{"code":0}`)
+				}
+			}))
+			defer srv.Close()
+			c := New(time.Second)
+			c.snapBase = srv.URL
+			res, err := c.Checkin(context.Background(), SignCredential{}, nil)
+			if err != nil || !res.OK || confirms != 0 || len(res.Unconfirmed) != 0 || res.Credits != 500 {
+				t.Fatalf("result=%+v err=%v confirms=%d", res, err, confirms)
+			}
+		})
+	}
+}
+
+// 确认失败 → 记 pending；下一次签到只补确认它，成功后清空；次日重新变为
+// ELIGIBLE 时本地不得缓存「已签」。
 func TestCheckinRecoversConfirmationAndDailyReset(t *testing.T) {
 	status := "ELIGIBLE"
 	claimCount, confirmCount := 0, 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case EpCreditDelivery:
-			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"items":[{"campaignId":1,"status":%q,"claimable":true,"benefitAmount":1000}]}}`, status)
+			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"items":[{"campaignId":1,"type":"USER_LOGIN","status":%q,"claimable":true,"benefitAmount":1000,"pendingTotalAmount":1000}]}}`, status)
 		case EpCreditClaim:
 			claimCount++
 			status = "CLAIMED"
-			_, _ = fmt.Fprint(w, `{"code":0}`)
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"benefit":{"id":321}}}`)
 		case EpCreditConfirm:
 			confirmCount++
 			if confirmCount == 1 {
-				// HTTP 200 的业务失败必须重试，不能当作确认成功。
 				_, _ = fmt.Fprint(w, `{"code":40001,"message":"try again"}`)
 				return
 			}
@@ -103,20 +145,63 @@ func TestCheckinRecoversConfirmationAndDailyReset(t *testing.T) {
 	defer srv.Close()
 	c := New(time.Second)
 	c.snapBase = srv.URL
-	for i, wantOK := range []bool{false, true, true} {
-		res, err := c.Checkin(context.Background(), SignCredential{})
-		if err != nil || res.OK != wantOK {
-			t.Fatalf("attempt %d result=%+v err=%v", i, res, err)
-		}
+
+	first, err := c.Checkin(context.Background(), SignCredential{}, nil)
+	if err != nil || first.OK || len(first.Unconfirmed) != 1 || first.Unconfirmed[0] != 1 {
+		t.Fatalf("first result=%+v err=%v", first, err)
+	}
+	second, err := c.Checkin(context.Background(), SignCredential{}, first.Unconfirmed)
+	if err != nil || !second.OK || len(second.Unconfirmed) != 0 {
+		t.Fatalf("retry result=%+v err=%v", second, err)
+	}
+	third, err := c.Checkin(context.Background(), SignCredential{}, second.Unconfirmed)
+	if err != nil || !third.OK {
+		t.Fatalf("settled result=%+v err=%v", third, err)
 	}
 	if claimCount != 1 || confirmCount != 2 {
 		t.Fatalf("duplicate or missing write: claim=%d confirm=%d", claimCount, confirmCount)
 	}
-	// 上游在次日重新变为 ELIGIBLE；本地不得永久缓存「已签」。
+
 	status = "ELIGIBLE"
-	res, err := c.Checkin(context.Background(), SignCredential{})
-	if err != nil || !res.OK || res.Credits != 1000 || claimCount != 2 || confirmCount != 3 {
-		t.Fatalf("daily reset not handled: result=%+v err=%v claim=%d confirm=%d", res, err, claimCount, confirmCount)
+	reset, err := c.Checkin(context.Background(), SignCredential{}, nil)
+	if err != nil || !reset.OK || reset.Credits != 1000 || claimCount != 2 || confirmCount != 3 {
+		t.Fatalf("daily reset not handled: result=%+v err=%v claim=%d confirm=%d", reset, err, claimCount, confirmCount)
+	}
+}
+
+// 每日签到按 type 选，不看写死的 id；新用户（4）保留为 Go 扩展。
+func TestCheckinSelectsDailyByTypeAndKeepsNewUser(t *testing.T) {
+	var claimed []int
+	confirms := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case EpCreditDelivery:
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"items":[
+				{"campaignId":7,"type":"USER_LOGIN","title":"daily","status":"ELIGIBLE","claimable":true,"benefitAmount":100,"pendingTotalAmount":100},
+				{"campaignId":1,"type":"OTHER","status":"ELIGIBLE","claimable":true,"benefitAmount":999},
+				{"campaignId":4,"type":"NEW_USER","title":"new user","status":"ELIGIBLE","claimable":true,"benefitAmount":4000,"pendingTotalAmount":4000}
+			]}}`)
+		case EpCreditClaim:
+			var body struct {
+				ID int `json:"campaignId"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			claimed = append(claimed, body.ID)
+			_, _ = fmt.Fprint(w, `{"code":0,"data":{"benefit":{"id":5}}}`)
+		case EpCreditConfirm:
+			confirms++
+			_, _ = fmt.Fprint(w, `{"code":0}`)
+		}
+	}))
+	defer srv.Close()
+	c := New(time.Second)
+	c.snapBase = srv.URL
+	res, err := c.Checkin(context.Background(), SignCredential{}, nil)
+	if err != nil || !res.OK {
+		t.Fatalf("result=%+v err=%v", res, err)
+	}
+	if !reflect.DeepEqual(claimed, []int{7, 4}) || confirms != 2 || res.Credits != 4100 {
+		t.Fatalf("claimed=%v confirms=%d credits=%g", claimed, confirms, res.Credits)
 	}
 }
 
@@ -127,7 +212,8 @@ func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
 		wantConfirm           int
 		wantCredits           float64
 	}{
-		{name: "new user", claim: `{"code":0}`, wantOK: true, wantConfirm: 1, wantCredits: 4000},
+		{name: "new user", claim: `{"code":0,"data":{"benefit":{"id":9}}}`, wantOK: true, wantConfirm: 1, wantCredits: 4000},
+		{name: "new user without ticket", claim: `{"code":0}`, wantOK: true, wantConfirm: 0, wantCredits: 4000},
 		{name: "claim business failure", claim: `{"code":40001,"message":"not ready"}`},
 		{name: "claim missing code", claim: `{"message":"ok"}`},
 		{name: "empty campaigns", delivery: `{"code":0,"data":{"items":[]}}`, wantOK: true},
@@ -143,7 +229,7 @@ func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
 				case EpCreditDelivery:
 					body := tc.delivery
 					if body == "" {
-						body = `{"code":0,"data":{"items":[{"campaignId":4,"title":"new user","status":"ELIGIBLE","claimable":true,"benefitAmount":4000}]}}`
+						body = `{"code":0,"data":{"items":[{"campaignId":4,"title":"new user","status":"ELIGIBLE","claimable":true,"benefitAmount":4000,"pendingTotalAmount":4000}]}}`
 					}
 					_, _ = fmt.Fprint(w, body)
 				case EpCreditClaim:
@@ -163,7 +249,7 @@ func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
 			defer srv.Close()
 			c := New(time.Second)
 			c.snapBase = srv.URL
-			res, err := c.Checkin(context.Background(), SignCredential{})
+			res, err := c.Checkin(context.Background(), SignCredential{}, nil)
 			if (err != nil) != tc.wantErr || res.OK != tc.wantOK || confirms != tc.wantConfirm || res.Credits != tc.wantCredits {
 				t.Fatalf("result=%+v err=%v confirms=%d", res, err, confirms)
 			}

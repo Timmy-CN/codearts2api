@@ -39,6 +39,8 @@ type Account struct {
 	refreshMu         sync.Mutex
 	checkinMu         sync.Mutex
 	checkin           *CheckinStatus
+	checkinPending    []int  // 本次 claim、confirm 失败的活动 id
+	checkinPendingDay string // 上面这些 id 属于哪一天（本地时区）
 	lastValidated     time.Time
 	errCount          int
 	coolUntil         time.Time

@@ -21,6 +21,7 @@ const (
 // CreditCampaign 是活动投放接口的脱敏条目；不保留 access 中的活动票据。
 type CreditCampaign struct {
 	ID                 int     `json:"campaignId"`
+	Type               string  `json:"type"` // USER_LOGIN = 每日领取（插件口径）
 	Title              string  `json:"title"`
 	Status             string  `json:"status"`
 	Claimable          bool    `json:"claimable"`
@@ -31,8 +32,14 @@ type CreditCampaign struct {
 		StartTime string `json:"startTime"`
 		EndTime   string `json:"endTime"`
 	} `json:"extra"`
+
+	// claimedHere 只对本次 Checkin 内新领取的活动为 true：它决定 `CLAIMED`
+	// 是否要补确认——IDE 自己留下的 pending 绝不替它确认（插件 0.3.0）。
+	claimedHere bool
 }
 
+// CreditClaimResult 单个活动的领取结果。Pending 表示已 claim 但确认失败，
+// 当天的下一次签到只在 Pending 时才补确认。
 type CreditClaimResult struct {
 	CampaignID int     `json:"campaign_id"`
 	Title      string  `json:"title"`
@@ -40,6 +47,7 @@ type CreditClaimResult struct {
 	Status     string  `json:"status"`
 	Credits    float64 `json:"credits,omitempty"`
 	Message    string  `json:"message"`
+	Pending    bool    `json:"pending,omitempty"`
 }
 
 // CheckinResult 的 Credits 是本次领取量，不是账号余额。
@@ -48,6 +56,11 @@ type CheckinResult struct {
 	Credits   float64             `json:"credits,omitempty"`
 	Message   string              `json:"message"`
 	Campaigns []CreditClaimResult `json:"campaigns"`
+
+	// Unconfirmed 是本次已 claim、但 confirm 失败的活动 id：当天的后续签到
+	// 只对它们补确认（插件 0.3.0 的 unconfirmed 账本口径），IDE 留下的
+	// pending 不会出现在这里。调用方按天保存，跨天自然丢弃。
+	Unconfirmed []int `json:"unconfirmed,omitempty"`
 }
 
 func (c *Client) creditRequest(ctx context.Context, method, path string, body any, cred SignCredential) (json.RawMessage, error) {
@@ -114,25 +127,49 @@ func (c *Client) FetchCreditCampaigns(ctx context.Context, cred SignCredential) 
 	return *data.Items, nil
 }
 
-// Checkin 领取每日签到（1）和新用户（4）积分。上游决定资格和每日刷新，
-// 已领取不再 claim；CLAIMED 只补 confirm。调用方应串行化同一账号的领取。
-func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResult, error) {
+// Checkin 领取每日签到（活动 `type == USER_LOGIN`，ID 1 兜底）和新用户（4）
+// 积分。上游决定资格和每日刷新，已领取不再 claim。
+//
+// 确认口径对齐插件 codearts 0.3.0：
+//   - claim 后，只有响应给出 `benefit.id` 才 confirm（`null` 是 IDE 故意留的
+//     pending，确认了反而可能把没到账的积分标成已到账）；
+//   - 上游已是 `CLAIMED` 时，只确认 unconfirmed 里记着的、本次 claim 失败的
+//     那一条，绝不替 IDE 确认它自己留下的 pending。
+//
+// unconfirmed 由调用方按天保存，跨天失效。调用方应串行化同一账号的领取。
+func (c *Client) Checkin(ctx context.Context, cred SignCredential, unconfirmed []int) (CheckinResult, error) {
 	campaigns, err := c.FetchCreditCampaigns(ctx, cred)
 	if err != nil {
 		return CheckinResult{Message: err.Error()}, err
 	}
+	pending := make(map[int]bool, len(unconfirmed))
+	for _, id := range unconfirmed {
+		pending[id] = true
+	}
 	out := CheckinResult{OK: true, Campaigns: make([]CreditClaimResult, 0)}
+	// 每日签到按 type 选（插件口径）；上游没给 type 时退回 ID 1 的旧启发式。
+	claimDaily := true
 	for _, campaign := range campaigns {
-		if campaign.ID != 1 && campaign.ID != 4 {
+		if strings.EqualFold(campaign.Type, dailyCheckinType) {
+			claimDaily = false
+			break
+		}
+	}
+	for _, campaign := range campaigns {
+		daily := strings.EqualFold(campaign.Type, dailyCheckinType)
+		if !daily && !(claimDaily && campaign.ID == 1) && campaign.ID != 4 {
 			continue
 		}
 		if campaign.BenefitUnit != "" && campaign.BenefitUnit != "CREDIT" {
 			continue
 		}
-		res := c.claimCreditCampaign(ctx, cred, campaign, time.Now())
+		res := c.claimCreditCampaign(ctx, cred, campaign, pending[campaign.ID], time.Now())
 		out.Campaigns = append(out.Campaigns, res)
 		out.OK = out.OK && res.OK
 		out.Credits += res.Credits
+		if res.Pending {
+			out.Unconfirmed = append(out.Unconfirmed, campaign.ID)
+		}
 	}
 	parts := make([]string, 0, len(out.Campaigns))
 	for _, res := range out.Campaigns {
@@ -145,7 +182,7 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential) (CheckinResul
 	return out, nil
 }
 
-func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, campaign CreditCampaign, now time.Time) CreditClaimResult {
+func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, campaign CreditCampaign, unconfirmed bool, now time.Time) CreditClaimResult {
 	res := CreditClaimResult{CampaignID: campaign.ID, Title: campaign.Title, Status: strings.TrimSpace(campaign.Status), OK: true}
 	if res.Title == "" {
 		res.Title = fmt.Sprintf("积分活动 %d", campaign.ID)
@@ -163,13 +200,22 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 		res.Message = "已领取"
 		return res
 	case "CLAIMED":
-		// 已到账但尚未确认；不得重复领取。
+		// 已到账但尚未确认，不能重复 claim。只补确认「本次 claim 失败」的那条：
+		// IDE 有意留下的 pending 一律不动（插件 0.3.0 dailyCheckin）。
+		if !unconfirmed {
+			res.Message = "已领取（等待上游确认，非本服务发起）"
+			return res
+		}
+		res.Credits = campaign.PendingTotalAmount
+		if res.Credits <= 0 {
+			res.Credits = campaign.BenefitAmount
+		}
 	case "ELIGIBLE":
 		if !campaign.Claimable {
 			res.OK, res.Message = false, "暂不可领取，稍后重试"
 			return res
 		}
-		_, err := c.creditRequest(ctx, http.MethodPost, EpCreditClaim, map[string]any{
+		raw, err := c.creditRequest(ctx, http.MethodPost, EpCreditClaim, map[string]any{
 			"campaignId": campaign.ID, "channel": creditChannel,
 			"idempotentKey": fmt.Sprintf("claim_%d_%d", campaign.ID, now.UnixMilli()),
 		}, cred)
@@ -182,6 +228,12 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 		if res.Credits <= 0 {
 			res.Credits = campaign.BenefitAmount
 		}
+		// 领取应答里 `benefit.id == null`（或缺 id）表示这次领取没有生成可确认
+		// 的票据：不 confirm，也不记为待确认。
+		if !claimProducedConfirmable(raw) {
+			res.Message = claimedMessage(res.Credits)
+			return res
+		}
 	case "":
 		res.Message = "未获得活动资格"
 		return res
@@ -190,13 +242,50 @@ func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, c
 		return res
 	}
 	if _, err := c.creditRequest(ctx, http.MethodPost, EpCreditConfirm, map[string]any{"campaignId": campaign.ID}, cred); err != nil {
-		res.OK, res.Message = false, "已领取，确认失败，稍后重试: "+err.Error()
+		res.OK, res.Message, res.Pending = false, "已领取，确认失败，稍后重试: "+err.Error(), true
 		return res
 	}
 	res.Status = "CONFIRMED"
 	res.Message = "已补确认"
 	if res.Credits > 0 {
-		res.Message = fmt.Sprintf("领取成功（%g 积分）", res.Credits)
+		res.Message = claimedMessage(res.Credits)
 	}
 	return res
+}
+
+// dailyCheckinType 是「每日领取」活动的类型（插件 DAILY_CHECKIN_TYPE）。
+const dailyCheckinType = "USER_LOGIN"
+
+func claimedMessage(credits float64) string {
+	if credits > 0 {
+		return fmt.Sprintf("领取成功（%g 积分）", credits)
+	}
+	return "领取成功"
+}
+
+// claimProducedConfirmable 判断 claim 应答是否给出了可确认的票据。
+// 应答形如 {"code":0,"data":{"benefit":{"id":...}}} 或直接是 benefit 对象；
+// 缺失、`data` 为空或 `benefit.id` 为 null 都表示没有票据可确认。
+func claimProducedConfirmable(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var data struct {
+		Benefit *struct {
+			ID json.RawMessage `json:"id"`
+		} `json:"benefit"`
+		ID json.RawMessage `json:"id"`
+	}
+	if json.Unmarshal(raw, &data) != nil {
+		return false
+	}
+	id := data.ID
+	if data.Benefit != nil {
+		id = data.Benefit.ID
+	}
+	if len(id) == 0 {
+		return false
+	}
+	trimmed := strings.TrimSpace(string(id))
+	return trimmed != "" && trimmed != "null"
 }

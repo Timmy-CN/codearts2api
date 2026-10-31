@@ -13,7 +13,7 @@ import (
 
 type failingCheckinClient struct{ calls int }
 
-func (f *failingCheckinClient) Checkin(context.Context, upstream.SignCredential) (upstream.CheckinResult, error) {
+func (f *failingCheckinClient) Checkin(context.Context, upstream.SignCredential, []int) (upstream.CheckinResult, error) {
 	f.calls++
 	return upstream.CheckinResult{}, errors.New("temporary activity failure")
 }
