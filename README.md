@@ -146,14 +146,14 @@ refresh_token 重试一次，而不是直接禁用账号。
 
 ### 每日签到与新手积分
 
-服务默认在启动和每次 watchdog 轮询时检查活动，自动领取每日签到积分及
-上游返回的可领取新用户积分。新增账号会在下一次轮询处理；也可在 WebUI
-点击「签到」/「全员签到」，或鉴权调用 `POST /admin/api/checkin`（可传 `{"uid":"账号 ID"}`）。
+服务每次 watchdog 轮询只领取每日签到；新用户积分（`campaignId == 4`）在
+**服务启动时领取一次**，不进入 30 分钟轮询。新增账号会在下一次轮询处理；
+也可在 WebUI 点击「签到」/「全员签到」，或鉴权调用
+`POST /admin/api/checkin`（可传 `{"uid":"账号 ID"}`）——手动入口也只领每日签到。
 
 签到口径对齐插件 codearts 0.3.0：
 
-- 每日签到按活动 `type == "USER_LOGIN"` 选择（上游没给 `type` 时退回 `campaignId == 1`）；
-  新用户 `campaignId == 4` 是 Go 侧保留的扩展，单独领取。
+- 每日签到按活动 `type == "USER_LOGIN"` 选择（上游没给 `type` 时退回 `campaignId == 1`）。
 - claim 应答里 `benefit.id` 为 `null` 或缺 id 时不确认（IDE 有意留下的 pending，
   确认了可能把没到账的积分标成已到账）。
 - 上游状态是 `CLAIMED` 时，只补确认「本服务当天 claim 且 confirm 失败」的那一条；
@@ -161,8 +161,8 @@ refresh_token 重试一次，而不是直接禁用账号。
 - 已确认/已消费不重复领取；资格、金额、每日刷新和活动起止时间均以上游返回为准，
   失败会在下一次轮询重试，不会因活动接口故障冷却或禁用推理账号。
 
-`credits_auto_claim: false` 或 `CA2A_CREDITS_AUTO_CLAIM=0` 可关闭自动领取，
-`watch.enabled: false` 会关闭整个轮询。手动签到仍可使用。
+`credits_auto_claim: false` 或 `CA2A_CREDITS_AUTO_CLAIM=0` 可关闭自动领取
+（连同启动时的新手领取），`watch.enabled: false` 会关闭整个轮询。手动签到仍可使用。
 这项活动与 `benefit_auto_claim` 的模型 Token 福利独立；面板显示最近领取结果。
 `credit.sh` 查登录态，`apply.sh` 仅续期。
 

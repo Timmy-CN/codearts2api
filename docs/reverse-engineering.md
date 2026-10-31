@@ -117,7 +117,7 @@ Body：
 
 - `GET /v1/ops/delivery?channel=IDE`：`{code:0,data:{items:[...]}}`。每日签到按
   `type == "USER_LOGIN"` 选择（没有 `type` 的旧响应退回活动 ID 1）；新用户（4）
-  是 Go 侧保留的扩展，不自动参与学生认证、邀请等其他活动。
+  在服务启动时领取一次，不进入每日轮询，也不自动参与学生认证、邀请等其他活动。
 - `POST /v1/ops/claim`：`{campaignId,channel:"IDE",idempotentKey:"claim_<ID>_<毫秒时间戳>"}`。
 - `POST /v1/ops/confirm`：`{campaignId}`。
 - `ELIGIBLE` 且 `claimable=true` 才领取；claim 应答 `benefit.id` 为 `null` 或缺 id

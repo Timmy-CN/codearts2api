@@ -154,7 +154,7 @@ func creditSummary(snap *upstream.CreditSnapshot) string {
 	return text
 }
 
-// adminCheckin 领取指定账号或全部启用账号的签到/新手活动积分。
+// adminCheckin 领取指定账号或全部启用账号的每日签到（不含启动时的新手积分）。
 func (h *Handler) adminCheckin(w http.ResponseWriter, r *http.Request) {
 	body, err := readUIDBody(r)
 	if err != nil {
@@ -177,7 +177,7 @@ func (h *Handler) adminCheckin(w http.ResponseWriter, r *http.Request) {
 		results = append(results, res)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": allOK(results), "message": summaryMsg("签到/新手领取", results), "results": results,
+		"ok": allOK(results), "message": summaryMsg("签到领取", results), "results": results,
 	})
 }
 

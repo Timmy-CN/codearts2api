@@ -127,8 +127,8 @@ func (c *Client) FetchCreditCampaigns(ctx context.Context, cred SignCredential) 
 	return *data.Items, nil
 }
 
-// Checkin 领取每日签到（活动 `type == USER_LOGIN`，ID 1 兜底）和新用户（4）
-// 积分。上游决定资格和每日刷新，已领取不再 claim。
+// Checkin 领取每日签到（活动 `type == USER_LOGIN`，ID 1 兜底）。上游决定资格
+// 和每日刷新，已领取不再 claim。新手积分不经这里，见 ClaimNewUser。
 //
 // 确认口径对齐插件 codearts 0.3.0：
 //   - claim 后，只有响应给出 `benefit.id` 才 confirm（`null` 是 IDE 故意留的
@@ -156,11 +156,11 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential, unconfirmed [
 		}
 	}
 	for _, campaign := range campaigns {
-		daily := strings.EqualFold(campaign.Type, dailyCheckinType)
-		if !daily && !(claimDaily && campaign.ID == 1) && campaign.ID != 4 {
+		if skipCreditCampaign(campaign) {
 			continue
 		}
-		if campaign.BenefitUnit != "" && campaign.BenefitUnit != "CREDIT" {
+		daily := strings.EqualFold(campaign.Type, dailyCheckinType)
+		if !daily && !(claimDaily && campaign.ID == 1) {
 			continue
 		}
 		res := c.claimCreditCampaign(ctx, cred, campaign, pending[campaign.ID], time.Now())
@@ -177,9 +177,37 @@ func (c *Client) Checkin(ctx context.Context, cred SignCredential, unconfirmed [
 	}
 	out.Message = strings.Join(parts, "; ")
 	if len(parts) == 0 {
-		out.Message = "无可领取的签到或新手活动"
+		out.Message = "今日无可领取的签到活动"
 	}
 	return out, nil
+}
+
+// ClaimNewUser 领取新用户活动（campaignId 4），供服务启动时调用一次。
+//
+// 上游决定资格和是否已领取：已领取、无资格、已结束都返回 OK，不重试、不进入
+// 每日签到流程。确认口径与 Checkin 相同（无票据不确认、只确认本次 claim）。
+func (c *Client) ClaimNewUser(ctx context.Context, cred SignCredential) (CheckinResult, error) {
+	campaigns, err := c.FetchCreditCampaigns(ctx, cred)
+	if err != nil {
+		return CheckinResult{Message: err.Error()}, err
+	}
+	for _, campaign := range campaigns {
+		if campaign.ID != 4 || skipCreditCampaign(campaign) {
+			continue
+		}
+		res := c.claimCreditCampaign(ctx, cred, campaign, false, time.Now())
+		return CheckinResult{
+			OK:        res.OK,
+			Credits:   res.Credits,
+			Message:   res.Title + ": " + res.Message,
+			Campaigns: []CreditClaimResult{res},
+		}, nil
+	}
+	return CheckinResult{OK: true, Message: "无新用户活动"}, nil
+}
+
+func skipCreditCampaign(c CreditCampaign) bool {
+	return c.BenefitUnit != "" && c.BenefitUnit != "CREDIT"
 }
 
 func (c *Client) claimCreditCampaign(ctx context.Context, cred SignCredential, campaign CreditCampaign, unconfirmed bool, now time.Time) CreditClaimResult {

@@ -19,7 +19,12 @@ type CheckinStatus struct {
 	CheckedAt time.Time `json:"checked_at"`
 }
 
-// Checkin 串行领取指定账号的每日签到和新手福利。活动故障只记录签到结果，
+// NewUserClaimer 可选：注入新用户积分领取（测试或自定义上游）。
+type NewUserClaimer interface {
+	ClaimNewUser(context.Context, upstream.SignCredential) (upstream.CheckinResult, error)
+}
+
+// Checkin 串行领取指定账号的每日签到。活动故障只记录签到结果，
 // 不计入推理错误、冷却或禁用；token 仍由原有 Validate/RefreshToken 处理。
 func (p *Pool) Checkin(ctx context.Context, name string) (upstream.CheckinResult, error) {
 	a := p.Get(name)
@@ -74,6 +79,45 @@ func (p *Pool) Checkin(ctx context.Context, name string) (upstream.CheckinResult
 	// 签到成功会入账新积分：丢掉积分缓存，下一次查询强制重读（插件同口径）。
 	if err == nil && result.OK {
 		p.InvalidateCredits(name)
+	}
+	return result, err
+}
+
+// ClaimNewUser 领取一次新用户积分（campaign 4）。仅供服务启动时调用：
+// 失败不重试、不进入每日签到状态，也不影响推理账号健康。
+func (p *Pool) ClaimNewUser(ctx context.Context, name string) (upstream.CheckinResult, error) {
+	a := p.Get(name)
+	if a == nil {
+		return upstream.CheckinResult{}, fmt.Errorf("account not found")
+	}
+	a.checkinMu.Lock()
+	defer a.checkinMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return upstream.CheckinResult{}, err
+	}
+	a.mu.Lock()
+	disabled := a.disabled
+	a.mu.Unlock()
+	if disabled {
+		return upstream.CheckinResult{}, fmt.Errorf("account disabled")
+	}
+	ok, err := p.Validate(a)
+	if err != nil || !ok {
+		if err == nil {
+			err = fmt.Errorf("token invalid; re-login required")
+		}
+		return upstream.CheckinResult{}, err
+	}
+	token, ak, sk := a.Auth.Credentials()
+	var claimer NewUserClaimer = a.Client
+	if p.cfg.NewUserClient != nil {
+		claimer = p.cfg.NewUserClient
+	}
+	result, err := claimer.ClaimNewUser(ctx, upstream.SignCredential{
+		SecurityToken: token, AccessKeyID: ak, SecretAccessKey: sk,
+	})
+	if err != nil {
+		result.OK, result.Message = false, err.Error()
 	}
 	return result, err
 }

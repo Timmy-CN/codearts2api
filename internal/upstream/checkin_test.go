@@ -170,7 +170,8 @@ func TestCheckinRecoversConfirmationAndDailyReset(t *testing.T) {
 }
 
 // 每日签到按 type 选，不看写死的 id；新用户（4）保留为 Go 扩展。
-func TestCheckinSelectsDailyByTypeAndKeepsNewUser(t *testing.T) {
+// 每日签到只领 USER_LOGIN；新用户（4）不再混进签到流程。
+func TestCheckinSelectsDailyByTypeOnly(t *testing.T) {
 	var claimed []int
 	confirms := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -200,26 +201,26 @@ func TestCheckinSelectsDailyByTypeAndKeepsNewUser(t *testing.T) {
 	if err != nil || !res.OK {
 		t.Fatalf("result=%+v err=%v", res, err)
 	}
-	if !reflect.DeepEqual(claimed, []int{7, 4}) || confirms != 2 || res.Credits != 4100 {
+	if !reflect.DeepEqual(claimed, []int{7}) || confirms != 1 || res.Credits != 100 {
 		t.Fatalf("claimed=%v confirms=%d credits=%g", claimed, confirms, res.Credits)
 	}
 }
 
-func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
+// 启动时的新手领取：只碰 campaign 4，已领取/无资格不报错。
+func TestClaimNewUserStartupOnly(t *testing.T) {
 	tests := []struct {
 		name, delivery, claim string
-		wantErr, wantOK       bool
+		wantOK, wantErr       bool
 		wantConfirm           int
 		wantCredits           float64
+		wantMessage           string
 	}{
-		{name: "new user", claim: `{"code":0,"data":{"benefit":{"id":9}}}`, wantOK: true, wantConfirm: 1, wantCredits: 4000},
-		{name: "new user without ticket", claim: `{"code":0}`, wantOK: true, wantConfirm: 0, wantCredits: 4000},
-		{name: "claim business failure", claim: `{"code":40001,"message":"not ready"}`},
-		{name: "claim missing code", claim: `{"message":"ok"}`},
-		{name: "empty campaigns", delivery: `{"code":0,"data":{"items":[]}}`, wantOK: true},
-		{name: "missing items", delivery: `{"code":0,"data":{}}`, wantErr: true},
-		{name: "missing business code", delivery: `{"data":{"items":[]}}`, wantErr: true},
-		{name: "delivery business failure", delivery: `{"code":40001,"message":"not ready"}`, wantErr: true},
+		{name: "fresh", claim: `{"code":0,"data":{"benefit":{"id":9}}}`, wantOK: true, wantConfirm: 1, wantCredits: 4000},
+		{name: "without ticket", claim: `{"code":0}`, wantOK: true, wantCredits: 4000},
+		{name: "already claimed", delivery: `{"code":0,"data":{"items":[{"campaignId":4,"title":"new user","status":"CONFIRMED","claimable":false,"benefitAmount":4000}]}}`, wantOK: true, wantMessage: "已领取"},
+		{name: "no campaign", delivery: `{"code":0,"data":{"items":[{"campaignId":1,"type":"USER_LOGIN","status":"ELIGIBLE","claimable":true}]}}`, wantOK: true, wantMessage: "无新用户活动"},
+		{name: "claim failure", claim: `{"code":40001,"message":"not ready"}`},
+		{name: "delivery failure", delivery: `{"code":40001,"message":"not ready"}`, wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -249,9 +250,41 @@ func TestCheckinNewUserAndMalformedResponses(t *testing.T) {
 			defer srv.Close()
 			c := New(time.Second)
 			c.snapBase = srv.URL
-			res, err := c.Checkin(context.Background(), SignCredential{}, nil)
+			res, err := c.ClaimNewUser(context.Background(), SignCredential{})
 			if (err != nil) != tc.wantErr || res.OK != tc.wantOK || confirms != tc.wantConfirm || res.Credits != tc.wantCredits {
 				t.Fatalf("result=%+v err=%v confirms=%d", res, err, confirms)
+			}
+			if tc.wantMessage != "" && !strings.Contains(res.Message, tc.wantMessage) {
+				t.Fatalf("message = %q, want %q", res.Message, tc.wantMessage)
+			}
+		})
+	}
+}
+
+func TestCheckinMalformedResponses(t *testing.T) {
+	tests := []struct {
+		name, delivery string
+		wantErr        bool
+	}{
+		{name: "empty campaigns", delivery: `{"code":0,"data":{"items":[]}}`},
+		{name: "missing items", delivery: `{"code":0,"data":{}}`, wantErr: true},
+		{name: "missing business code", delivery: `{"data":{"items":[]}}`, wantErr: true},
+		{name: "delivery business failure", delivery: `{"code":40001,"message":"not ready"}`, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == EpCreditDelivery {
+					_, _ = fmt.Fprint(w, tc.delivery)
+					return
+				}
+				t.Errorf("unexpected write: %s", r.URL.Path)
+			}))
+			defer srv.Close()
+			c := New(time.Second)
+			c.snapBase = srv.URL
+			if _, err := c.Checkin(context.Background(), SignCredential{}, nil); (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr=%v", err, tc.wantErr)
 			}
 		})
 	}

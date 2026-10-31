@@ -13,8 +13,8 @@ import (
 
 // Auth 单个账号凭证（登录 oauth2/tokens 返回）。
 type Auth struct {
-	UserID          string `json:"user_id"`
-	UserName        string `json:"user_name"`
+	UserID   string `json:"user_id"`
+	UserName string `json:"user_name"`
 	// UserPhone 是 IAM 读回的脱敏手机号（138****8000，插件 0.2.5），只作
 	// 显示名；空表示还没读到（旧凭证）或读失败。
 	UserPhone       string `json:"user_phone,omitempty"`

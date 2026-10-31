@@ -52,7 +52,7 @@ type Config struct {
 	// 领取是幂等操作（官方客户端打开模型菜单即调用），不领取时福利模型一律
 	// 返回 InferHub.4004.200 benefit not found。置 false 可关掉这个写操作。
 	BenefitAutoClaim bool `json:"benefit_auto_claim"`
-	// CreditsAutoClaim 每次 watchdog 轮询领取每日签到和新手活动积分（默认 true）。
+	// CreditsAutoClaim 每次 watchdog 轮询领取每日签到；新用户积分在启动时领一次（默认 true）。
 	CreditsAutoClaim bool `json:"credits_auto_claim"`
 
 	Upstream struct {

@@ -6,7 +6,7 @@ import (
 )
 
 // IdentityFromRefreshToken 从 refresh_token JWT 的 user_profile 解账号身份
-//（插件 accountIdentityOf 同口径）；STS 的 code/refresh 响应本身不带用户字段。
+// （插件 accountIdentityOf 同口径）；STS 的 code/refresh 响应本身不带用户字段。
 func TestIdentityFromRefreshTokenObjectProfile(t *testing.T) {
 	payload := `{"user_profile":{"principal_urn":"iam:codearts:user:zhangsan","user_name":"张三","domain_name":"d1"},"sub":"sub-1"}`
 	tok := "h." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".s"

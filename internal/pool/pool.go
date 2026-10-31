@@ -63,6 +63,7 @@ type Config struct {
 	KeepaliveWindow time.Duration        // 保活心跳窗口，超过此时间无活动则发送心跳
 	LoginConfig     upstream.LoginConfig // OAuth/refresh 端点；零值使用生产默认
 	CheckinClient   CheckinClient        // 可选活动客户端；nil 使用账号 Client
+	NewUserClient   NewUserClaimer       // 可选新用户积分客户端；nil 使用账号 Client
 	BenefitClient   BenefitClient        // 可选福利领取客户端；nil 使用账号 Client
 	CreditsClient   CreditsClient        // 可选积分查询客户端；nil 使用账号 Client
 }

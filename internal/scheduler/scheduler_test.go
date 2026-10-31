@@ -41,3 +41,35 @@ func TestAutoCheckinOptOutAndRetry(t *testing.T) {
 		t.Fatal("disabled account was claimed")
 	}
 }
+
+// 新用户积分只在启动时领一次：Tick（30 分钟轮询）不再碰它。
+func TestNewUserClaimedOnlyAtStartup(t *testing.T) {
+	client := &recordingClaimClient{}
+	p, err := pool.New([]*auth.Auth{
+		auth.New("u1", "user", "domain", "token", "ak", "sk", time.Now().Add(2*time.Hour).Format(time.RFC3339), "", ""),
+	}, pool.Config{ErrThreshold: 99, NewUserClient: client}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{Pool: p})
+	s.claimNewUserOnce(context.Background())
+	if client.newUsers != 1 {
+		t.Fatalf("startup claim calls = %d, want 1", client.newUsers)
+	}
+	s.Tick(context.Background())
+	if client.newUsers != 1 {
+		t.Fatalf("Tick must not claim new-user credits again: calls = %d", client.newUsers)
+	}
+}
+
+type recordingClaimClient struct{ checkins, newUsers int }
+
+func (c *recordingClaimClient) Checkin(context.Context, upstream.SignCredential, []int) (upstream.CheckinResult, error) {
+	c.checkins++
+	return upstream.CheckinResult{OK: true}, nil
+}
+
+func (c *recordingClaimClient) ClaimNewUser(context.Context, upstream.SignCredential) (upstream.CheckinResult, error) {
+	c.newUsers++
+	return upstream.CheckinResult{OK: true}, nil
+}

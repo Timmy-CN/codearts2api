@@ -17,7 +17,7 @@ import (
 type Config struct {
 	Pool              *pool.Pool
 	Enabled           bool
-	CreditsAutoClaim  bool          // 自动领取每日签到/新手积分，与 Token 模型福利独立
+	CreditsAutoClaim  bool          // 自动领取每日签到；新用户积分在启动时领一次
 	BenefitAutoClaim  bool          // 自动领取每日限时福利（免费模型当天可用，默认 true）
 	PollInterval      time.Duration // 默认 30m
 	RefreshSkew       time.Duration // 到期前多久刷新，默认 30m
@@ -54,6 +54,10 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 	// 立即执行一次
 	s.Tick(ctx)
+	// 新用户积分只在服务启动时领一次，之后不进入 30 分钟轮询。
+	if s.cfg.CreditsAutoClaim {
+		s.claimNewUserOnce(ctx)
+	}
 
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
@@ -111,5 +115,25 @@ func (s *Scheduler) Tick(ctx context.Context) {
 		} else {
 			log.Printf("token account=%s invalid/disabled", acct.Name)
 		}
+	}
+}
+
+// claimNewUserOnce 启动时领取一次新用户积分（campaign 4），失败只记日志。
+func (s *Scheduler) claimNewUserOnce(ctx context.Context) {
+	for _, acct := range s.cfg.Pool.Accounts() {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if !s.cfg.Pool.Enabled(acct.Name) {
+			continue
+		}
+		claimCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		result, err := s.cfg.Pool.ClaimNewUser(claimCtx, acct.Name)
+		cancel()
+		if err != nil {
+			log.Printf("new-user claim failed account=%s err=%v", acct.Name, err)
+			continue
+		}
+		log.Printf("new-user claim account=%s ok=%t message=%s", acct.Name, result.OK, result.Message)
 	}
 }
