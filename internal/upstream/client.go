@@ -531,8 +531,33 @@ func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOp
 	if chatID != "" {
 		body["chat_id"] = chatID
 	}
-	if opts.ReasoningEffort != "" {
-		body["reasoning_effort"] = opts.ReasoningEffort
+	// 推理等级按模型自己的表处理（插件 0.3.3/0.3.4）：
+	//   - none/off/disabled：摘掉等级，未显式指定 thinking 时发 disabled；
+	//   - 模型接受的等级：原样发，且不再注入 thinking enabled；
+	//   - 模型不接受的等级：摘掉，别让上游用 400 打回整个请求；
+	//   - 未知模型（没有实测表）：等级原样透传。
+	spoken := strings.ToLower(strings.TrimSpace(opts.ReasoningEffort))
+	thinking := "enabled"
+	if opts.Thinking != nil {
+		thinking = ""
+		if *opts.Thinking {
+			thinking = "enabled"
+		}
+	}
+	if spoken != "" {
+		levels := ReasoningLevels(CanonicalModel(model))
+		switch {
+		case IsNoThinkingEffort(spoken):
+			if opts.Thinking == nil {
+				thinking = "disabled"
+			}
+		case len(levels) == 0 || levelIn(levels, spoken):
+			body["reasoning_effort"] = spoken
+			thinking = ""
+		default:
+			// 模型不接受的等级：请求按原样走，也不注入 thinking（插件同口径）
+			thinking = ""
+		}
 	}
 	if opts.MaxTokens != nil {
 		mt := *opts.MaxTokens
@@ -541,8 +566,8 @@ func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOp
 		}
 		body["max_tokens"] = mt
 	}
-	if opts.Thinking == nil || *opts.Thinking {
-		body["thinking"] = map[string]any{"type": "enabled"}
+	if thinking != "" {
+		body["thinking"] = map[string]any{"type": thinking}
 	}
 	if opts.Temperature != nil {
 		body["temperature"] = *opts.Temperature

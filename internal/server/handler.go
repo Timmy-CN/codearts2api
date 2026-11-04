@@ -777,6 +777,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			TopP:            req.TopP,
 			Tools:           tools,
 			ToolChoice:      nativeToolChoice(req.ToolChoice),
+			Thinking:        req.Thinking,
 		}
 		// 上游并发会话/TPM 排队是瞬时的。对齐 CodeArts Agent IDE
 		// 参考实现：默认每 10s 重试同一账号，最多 180 次（30min）。
@@ -786,7 +787,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		authRetried := false
 		benefitRetried := false
 		thinkingRetried := false
-		thinkingInjected := req.Thinking == nil
+		thinkingInjected := req.Thinking == nil && strings.TrimSpace(req.ReasoningEffort) == ""
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
 		benefit := upstream.IsBenefitModel(acct.UID, model)
 		noteTraffic(acct.UID) // 有真实流量：本轮探测整体避让

@@ -132,9 +132,13 @@ refresh_token 重试一次，而不是直接禁用账号。
 - **网关排队**：上游 `429 + queue-status: queued + trace-id` 时，按 `retry-after`
   轮询 `concurrency/trace-queues/{id}` 直到 `promoted` 再重发；预算 300s、连续
   3 次轮询失败或被移出队列则 DELETE 退出并回 429。
-- **thinking 注入**：请求未显式给 `thinking` 时注入 `{"type":"enabled"}`（思考链
-  才会进 `reasoning_content`）；被模型以参数错误拒绝（400 文案点名 thinking）时
-  自动摘除重发一次。可用 `thinking: false` 显式关闭。
+- **thinking 注入**：请求未显式给 `thinking`、也没给 `reasoning_effort` 时注入
+  `{"type":"enabled"}`（思考链才会进 `reasoning_content`）；被模型以参数错误拒绝
+  （400 文案点名 thinking）时自动摘除重发一次。`thinking: false` 显式关闭。
+- **推理等级**：按模型实测表处理 `reasoning_effort`——`none`/`off`/`disabled`
+  摘掉等级并改发 `thinking:{"type":"disabled"}`；模型不接受的等级直接摘掉，
+  避免上游 400；模型接受的等级原样发，且不再注入 `thinking: enabled`。
+  未知模型没有实测表，等级原样透传。
 - **max_tokens 钳制**：超过 65536 一律钳到上限，避免上游拒绝。
 - **不跟随重定向**：签名请求与令牌请求遇到 3xx 一律转 502，AK 签名头与
   security token 绝不随跳转外泄。
