@@ -125,3 +125,46 @@ func TestChatThinkingRejectedStripsAndRetries(t *testing.T) {
 		})
 	}
 }
+
+// TestChatBenefitNoFreeChannelRetriesPlain：账号没有免费渠道时上游回
+// InferHub.APIG.0101.404；摘掉 maas_type 同账号重发一次，并记住该模型无福利。
+func TestChatBenefitNoFreeChannelRetriesPlain(t *testing.T) {
+	var attempts, benefitCalls atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if r.Header.Get(upstream.HeaderMaasType) == upstream.MaasBenefit {
+			benefitCalls.Add(1)
+			_, _ = w.Write([]byte("data: {\"error_code\":\"InferHub.APIG.0101.404\",\"error_msg\":\"no free channel\"}\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer backend.Close()
+
+	auths := []*auth.Auth{
+		auth.New("u1", "tester", "domain", "token", "ak", "sk", time.Now().Add(time.Hour).Format(time.RFC3339), "", ""),
+	}
+	p, err := pool.New(auths, pool.Config{MaxConcurrent: 1, ErrThreshold: 3}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream.SetAccountModels("u1", []upstream.ModelInfo{{ID: "glm-5.3-flash", Benefit: true}})
+	for _, acct := range p.Accounts() {
+		acct.Client = upstream.NewWithChatEndpoint(time.Second, backend.URL)
+	}
+	h := NewHandler(Config{Pool: p, DefaultModel: "glm-5.3-flash", MaxRotate: 1, ErrThreshold: 3})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3-flash","stream":false,"messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("plain retry should succeed: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if attempts.Load() != 2 || benefitCalls.Load() != 1 {
+		t.Fatalf("attempts=%d benefitCalls=%d want 2/1", attempts.Load(), benefitCalls.Load())
+	}
+	if upstream.IsBenefitModel("u1", "glm-5.3-flash") {
+		t.Fatal("model should be remembered as no-benefit")
+	}
+}

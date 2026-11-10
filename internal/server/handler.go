@@ -786,6 +786,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var serr error
 		authRetried := false
 		benefitRetried := false
+		benefitNoFreeRetried := false
 		thinkingRetried := false
 		thinkingInjected := req.Thinking == nil && strings.TrimSpace(req.ReasoningEffort) == ""
 		// 限时福利路由按「本次实际使用的账号」判定：账号池里套餐可能不同。
@@ -816,6 +817,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上次领取已过期）。照 magpie 插件口径：先补领一次再重发同一账号。
 			// 门控用错误本身而不是请求前的预判——上游报 4004 就证明该模型走
 			// 福利路由（目录未发现/漏标记的账号也能被这条兜住），重发时带头。
+			// 账号没有免费渠道：福利头被 InferHub.APIG.0101.404 拒。摘掉
+			// maas_type 同账号重发一次，并记住该模型没有福利路由（插件 0.3.6）。
+			if !benefitNoFreeRetried && benefit && strings.Contains(serr.Error(), "InferHub.APIG.0101.404") {
+				benefitNoFreeRetried = true
+				benefit = false
+				upstream.MarkNoBenefit(acct.UID, model)
+				log.Printf("benefit model %s refused account=%s (no free channel): retrying as plain model", model, acct.Name)
+				continue
+			}
 			if !benefitRetried && isBenefitNotClaimedError(serr) {
 				benefitRetried = true
 				benefit = true

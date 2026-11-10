@@ -407,3 +407,30 @@ func TestVisionModelsFilteredFromAllSources(t *testing.T) {
 		}
 	}
 }
+
+// TestIsNoBenefitChannel gateway/config 的 4000 / group not found 视为空福利列表。
+func TestIsNoBenefitChannel(t *testing.T) {
+	for _, raw := range []string{
+		`{"error_code":"4000","error_msg":"invalid channel, group not found"}`,
+		`{"error_msg":"group not found"}`,
+	} {
+		if !isNoBenefitChannel([]byte(raw)) {
+			t.Errorf("should be no-benefit: %s", raw)
+		}
+	}
+	if isNoBenefitChannel([]byte(`{"error_code":"0000","result":{"models":[]}}`)) {
+		t.Error("normal empty list is not a no-benefit answer")
+	}
+}
+
+// TestMarkNoBenefit 标记后 IsBenefitModel 不再按福利路由。
+func TestMarkNoBenefit(t *testing.T) {
+	SetAccountModels("m1", []ModelInfo{{ID: "glm-5.3-flash", Benefit: true}})
+	if !IsBenefitModel("m1", "glm-5.3-flash") {
+		t.Fatal("setup: should be benefit")
+	}
+	MarkNoBenefit("m1", "glm-5.3-flash")
+	if IsBenefitModel("m1", "glm-5.3-flash") {
+		t.Fatal("after MarkNoBenefit should be plain")
+	}
+}

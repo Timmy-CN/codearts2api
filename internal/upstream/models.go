@@ -231,6 +231,30 @@ func IsBenefitModel(accountID, model string) bool {
 	return seedBenefit[key]
 }
 
+// MarkNoBenefit 记住该账号的这个模型没有福利路由：InferHub.APIG.0101.404
+// 表示账号没有免费渠道，之后同模型直接发普通模型（插件 0.3.6 / #905）。
+func MarkNoBenefit(accountID, model string) {
+	key := strings.ToLower(strings.TrimSpace(model))
+	if accountID == "" || key == "" {
+		return
+	}
+	catalog.Lock()
+	defer catalog.Unlock()
+	ac := catalog.accounts[accountID]
+	if ac == nil {
+		ac = &accountCatalog{
+			benefit:     map[string]bool{},
+			knows:       map[string]bool{},
+			lastBenefit: map[string]ModelInfo{},
+			fetched:     time.Now(),
+		}
+		catalog.accounts[accountID] = ac
+	}
+	ac.knows[key] = true
+	delete(ac.benefit, key)
+	delete(ac.lastBenefit, key)
+}
+
 // lookupKnownModel 按小写 ID 查精确模型 ID（种子 + 已发现模型）。
 func lookupKnownModel(id string) (string, bool) {
 	key := strings.ToLower(strings.TrimSpace(id))
@@ -660,16 +684,24 @@ func (c *Client) ClaimBenefit(cred SignCredential) error {
 	return nil
 }
 
+// isNoBenefitChannel 识别「该账号没有免费渠道」的 gateway/config 应答：
+// error_code=4000 或 error_msg 含 group not found（插件 0.3.6 / #905）。
+func isNoBenefitChannel(raw []byte) bool {
+	var payload struct {
+		ErrorCode string `json:"error_code"`
+		ErrorMsg  string `json:"error_msg"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &payload) != nil {
+		return false
+	}
+	return payload.ErrorCode == "4000" || strings.Contains(strings.ToLower(payload.ErrorMsg), "group not found")
+}
+
 // fetchBenefitModels 拉取限时福利模型（gateway/config），返回结果整体标记 Benefit。
 func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]ModelInfo, error) {
 	key := accountID + "|benefit"
 	if c.srcBlocked(key) {
 		return nil, fmt.Errorf("benefit source backoff")
-	}
-	if c.claimAuto.Load() {
-		if err := c.ClaimBenefit(cred); err != nil {
-			Log("benefit claim: %v", err)
-		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -690,6 +722,12 @@ func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]Mo
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	// 账号没有任何免费渠道：gateway/config 回 error_code=4000 / group not found
+	// （任意状态码）。这是一份「没有福利模型」的列表，不是读取失败（插件 0.3.6 / #905）。
+	if isNoBenefitChannel(raw) {
+		c.clearSrcFail(key)
+		return []ModelInfo{}, nil
+	}
 	if resp.StatusCode >= 400 {
 		c.noteSrcFail(key)
 		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: EpBenefitConfig}
@@ -714,6 +752,11 @@ func (c *Client) fetchBenefitModels(accountID string, cred SignCredential) ([]Mo
 	if out.ErrorCode != "0000" {
 		c.noteSrcFail(key)
 		return nil, fmt.Errorf("gateway/config error_code=%s", out.ErrorCode)
+	}
+	if c.claimAuto.Load() && len(out.Result.Models) > 0 {
+		if err := c.ClaimBenefit(cred); err != nil {
+			Log("benefit claim: %v", err)
+		}
 	}
 	c.clearSrcFail(key)
 	infos := make([]ModelInfo, 0, len(out.Result.Models))
