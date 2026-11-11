@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 )
@@ -177,10 +176,21 @@ func deltaFromChunk(payload map[string]any) (delta map[string]any, finishReason 
 	return delta, finishReason
 }
 
-type toolCallAccumulator map[int]*ChatToolCall
+// toolCallAccumulator 按上游 index 聚合 tool_calls；open 记录每个 index 上
+// 正在写入的那一条。同一个 index 出现新的 id 说明是另一条调用（插件 0.3.7 /
+// plugins#930：两条调用被拼成 {"a"}{"b"}），新开一条而不是继续追加。
+type toolCallAccumulator struct {
+	slots map[int]*ChatToolCall
+	open  map[int]*ChatToolCall
+	order []*ChatToolCall
+}
+
+func newToolCallAccumulator() *toolCallAccumulator {
+	return &toolCallAccumulator{slots: map[int]*ChatToolCall{}, open: map[int]*ChatToolCall{}}
+}
 
 // applyToolCallDeltas 聚合 OpenAI 流式 tool_calls 的 id/name/arguments 分片。
-func applyToolCallDeltas(delta map[string]any, calls toolCallAccumulator) {
+func applyToolCallDeltas(delta map[string]any, calls *toolCallAccumulator) {
 	rawCalls, ok := delta["tool_calls"].([]any)
 	if !ok {
 		return
@@ -197,10 +207,13 @@ func applyToolCallDeltas(delta map[string]any, calls toolCallAccumulator) {
 		case int:
 			index = v
 		}
-		call := calls[index]
-		if call == nil {
+		call := calls.open[index]
+		id, _ := m["id"].(string)
+		if call == nil || (id != "" && call.ID != "" && id != call.ID) {
 			call = &ChatToolCall{Index: index, Type: "function"}
-			calls[index] = call
+			calls.slots[index] = call
+			calls.open[index] = call
+			calls.order = append(calls.order, call)
 		}
 		if id, ok := m["id"].(string); ok && id != "" {
 			call.ID = id
@@ -219,15 +232,13 @@ func applyToolCallDeltas(delta map[string]any, calls toolCallAccumulator) {
 	}
 }
 
-func sortedToolCalls(calls toolCallAccumulator) []ChatToolCall {
-	indexes := make([]int, 0, len(calls))
-	for index := range calls {
-		indexes = append(indexes, index)
+func sortedToolCalls(calls *toolCallAccumulator) []ChatToolCall {
+	if calls == nil {
+		return nil
 	}
-	sort.Ints(indexes)
-	out := make([]ChatToolCall, 0, len(indexes))
-	for _, index := range indexes {
-		out = append(out, *calls[index])
+	out := make([]ChatToolCall, 0, len(calls.order))
+	for _, c := range calls.order {
+		out = append(out, *c)
 	}
 	return out
 }
@@ -426,7 +437,7 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 		reason  strings.Builder
 		finish  = "stop"
 		upErr   error
-		calls   = make(toolCallAccumulator)
+		calls   = newToolCallAccumulator()
 		usage   map[string]any
 	)
 	var pendingEvent string
@@ -522,7 +533,7 @@ func StreamCaptureWithUsageNamed(w http.ResponseWriter, r io.Reader, model strin
 		reason    strings.Builder
 		finish    = "stop"
 		streamErr error
-		calls     = make(toolCallAccumulator)
+		calls     = newToolCallAccumulator()
 		usage     map[string]any
 	)
 	var pendingEvent string
