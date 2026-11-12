@@ -87,6 +87,28 @@ func TestFetchCreditSnapshot(t *testing.T) {
 	}
 }
 
+// 批次计数器可能滞后于桶：每个桶的作废合计不超过该桶自己的剩余
+// （插件 codearts 0.3.8 / plugins#982）。
+func TestBuildCreditSnapshotCapsHintsToBucketRemain(t *testing.T) {
+	now := time.UnixMilli(1793000000000)
+	stats := &CreditStatistics{Buckets: []CreditBucket{
+		{Name: MetricTotalCredit, Remain: 450},
+		{Name: MetricBasicCredit, Remain: 400},
+		{Name: MetricBonusCredit, Remain: 50},
+	}}
+	batches := []CreditBatch{
+		{Metric: MetricBasicCredit, Left: 400, ExpiresAt: now.UnixMilli() + 3600_000},
+		{Metric: MetricBonusCredit, Left: 400, ExpiresAt: now.UnixMilli() + 7200_000},
+	}
+	snap := BuildCreditSnapshot(stats, batches, nil, now)
+	if len(snap.Expiring) != 2 {
+		t.Fatalf("expiring = %+v", snap.Expiring)
+	}
+	if snap.Expiring[0].Credit != 400 || snap.Expiring[1].Credit != 50 {
+		t.Fatalf("expiring = %+v, 期望 bonus 被桶剩余 50 截断", snap.Expiring)
+	}
+}
+
 func writeJSONEnvelope(w http.ResponseWriter, body string) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = io.WriteString(w, body)

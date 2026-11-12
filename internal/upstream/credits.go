@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"time"
@@ -443,13 +444,35 @@ func BuildCreditSnapshot(stats *CreditStatistics, batches []CreditBatch, tokens 
 		resetsAt = ParseVendorTimeString(stats.EndDate)
 	}
 	snap.ResetsAt = resetsAt
-	hints := make([]ExpireHint, 0, len(batches))
-	for _, b := range batches {
-		if b.Left > 0 && b.ExpiresAt > now.UnixMilli() {
-			hints = append(hints, ExpireHint{At: b.ExpiresAt, Credit: b.Left})
+	// 每个桶的作废合计不超过该桶自己的剩余：批次计数器可能滞后于桶
+	// （插件 codearts 0.3.8 / plugins#982）。按到期时间升序吃各桶的额度。
+	remainOf := map[string]float64{}
+	if stats != nil {
+		for _, b := range stats.Buckets {
+			if b.Name != MetricTotalCredit {
+				remainOf[b.Name] = maxFloat(0, b.Remain)
+			}
 		}
 	}
-	sort.SliceStable(hints, func(i, j int) bool { return hints[i].At < hints[j].At })
+	live := make([]CreditBatch, 0, len(batches))
+	for _, b := range batches {
+		if b.Left > 0 && b.ExpiresAt > now.UnixMilli() {
+			live = append(live, b)
+		}
+	}
+	sort.SliceStable(live, func(i, j int) bool { return live[i].ExpiresAt < live[j].ExpiresAt })
+	hints := make([]ExpireHint, 0, len(live))
+	for _, b := range live {
+		credit := b.Left
+		if cap, ok := remainOf[b.Metric]; ok {
+			credit = math.Min(credit, cap)
+			remainOf[b.Metric] = cap - credit
+		}
+		if credit <= 0 {
+			continue
+		}
+		hints = append(hints, ExpireHint{At: b.ExpiresAt, Credit: credit})
+	}
 	if len(hints) > 10 {
 		hints = hints[:10]
 	}
