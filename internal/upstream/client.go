@@ -438,6 +438,8 @@ type ChatOptions struct {
 	TopP            *float64
 	Tools           []map[string]any
 	ToolChoice      any
+	// Stop 是停止序列：上游只收单个字符串（插件 codearts 0.3.15 口径），空串不发。
+	Stop string
 	// Thinking 未指定（nil）时注入 thinking:{type:"enabled"}（官方客户端行为）；
 	// 显式 false 不注入；true 强制注入。
 	Thinking *bool
@@ -574,6 +576,9 @@ func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOp
 	}
 	if opts.TopP != nil {
 		body["top_p"] = *opts.TopP
+	}
+	if opts.Stop != "" {
+		body["stop"] = opts.Stop
 	}
 	if len(opts.Tools) > 0 {
 		body["tools"] = opts.Tools

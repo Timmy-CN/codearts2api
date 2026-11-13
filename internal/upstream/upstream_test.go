@@ -364,3 +364,15 @@ func TestSigner(t *testing.T) {
 		t.Fatalf("headers=%v", req.Header)
 	}
 }
+
+// stop 只以字符串发给网关；空串不发（插件 codearts 0.3.15）。
+func TestChatBodyV2SendsStopAsString(t *testing.T) {
+	msgs := []ChatMessage{{Role: "user", Content: "hi"}}
+	body := chatBodyV2("", msgs, "glm-5.2", ChatOptions{Stop: "END"})
+	if body["stop"] != "END" {
+		t.Fatalf("stop = %#v", body["stop"])
+	}
+	if _, has := chatBodyV2("", msgs, "glm-5.2", ChatOptions{})["stop"]; has {
+		t.Fatal("empty stop must not be sent")
+	}
+}

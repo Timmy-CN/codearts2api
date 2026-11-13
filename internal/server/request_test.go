@@ -252,3 +252,29 @@ func TestFlattenContent(t *testing.T) {
 }
 
 var _ = strings.TrimSpace
+
+// stop 只发字符串：数组取第一个非空串，空数组/空串/空白/其它类型一律不发
+// （插件 codearts 0.3.15 / magpie#6342：数组会被网关打回 001001005.400）。
+func TestParseChatRequestStop(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"string", `{"stop":"END","messages":[{"role":"user","content":"x"}]}`, "END"},
+		{"array first non-empty", `{"stop":["","STOP","OTHER"],"messages":[{"role":"user","content":"x"}]}`, "STOP"},
+		{"empty array", `{"stop":[],"messages":[{"role":"user","content":"x"}]}`, ""},
+		{"blank string", `{"stop":"   ","messages":[{"role":"user","content":"x"}]}`, ""},
+		{"number", `{"stop":3,"messages":[{"role":"user","content":"x"}]}`, ""},
+		{"null", `{"stop":null,"messages":[{"role":"user","content":"x"}]}`, ""},
+	}
+	for _, tc := range cases {
+		req, err := parseChatRequest([]byte(tc.body))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if req.Stop != tc.want {
+			t.Fatalf("%s: stop=%q want %q", tc.name, req.Stop, tc.want)
+		}
+	}
+}

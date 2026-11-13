@@ -45,11 +45,46 @@ type chatRequest struct {
 	MaxTokens       *int
 	Temperature     *float64
 	TopP            *float64
+	Stop            string // 上游只认字符串：数组取第一个非空串，空/空白/其它类型不发
 	Messages        []openAIMessage
 	Tools           []map[string]any
 	ToolChoice      toolChoiceOpenAI
 	ConversationID  string
 	Thinking        *bool
+}
+
+// parseStop 归一化 stop：华为网关只收字符串，数组（含空数组）会被当成
+// InferHub.001001005.400「The request param is invalid」打回整个请求
+// （插件 codearts 0.3.15 / magpie#6342）。数组取第一个非空字符串；空串、
+// 空白串或其它类型一律不发。
+func parseStop(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return trimNonEmpty(text)
+	}
+	var list []json.RawMessage
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return ""
+	}
+	for _, item := range list {
+		var one string
+		if err := json.Unmarshal(item, &one); err == nil {
+			if v := trimNonEmpty(one); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func trimNonEmpty(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return ""
+	}
+	return s
 }
 
 // parseChatRequest 解析并校验请求体。
@@ -65,6 +100,7 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		MaxCompletionTokens *int              `json:"max_completion_tokens"`
 		Temperature         *float64          `json:"temperature"`
 		TopP                *float64          `json:"top_p"`
+		Stop                json.RawMessage   `json:"stop"`
 		ConversationID      string            `json:"conversation_id"`
 		Messages            []json.RawMessage `json:"messages"`
 		Tools               []map[string]any  `json:"tools"`
@@ -89,6 +125,7 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 		Tools:           raw.Tools,
 		ToolChoice:      parseToolChoice(raw.ToolChoice),
 		Thinking:        parseThinking(raw.Thinking),
+		Stop:            parseStop(raw.Stop),
 	}
 	if raw.MaxCompletionTokens != nil {
 		req.MaxTokens = raw.MaxCompletionTokens

@@ -775,6 +775,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			MaxTokens:       req.MaxTokens,
 			Temperature:     req.Temperature,
 			TopP:            req.TopP,
+			Stop:            req.Stop,
 			Tools:           tools,
 			ToolChoice:      nativeToolChoice(req.ToolChoice),
 			Thinking:        req.Thinking,
